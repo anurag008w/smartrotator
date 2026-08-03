@@ -381,7 +381,7 @@ class Rotator:
         model: Optional[str] = None,
         *,
         models: Optional[list[str]] = None,   # UI multi-select: inhi models se rotation
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         temperature: float = 0.7,
         max_fallback_attempts: Optional[int] = None,
         tools: Optional[list[dict]] = None,

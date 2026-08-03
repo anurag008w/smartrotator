@@ -149,7 +149,7 @@ def _admin_usernames(cfg: dict) -> set[str]:
 class ChatCompletionRequest(BaseModel):
     model: str = ""
     messages: list[dict] = Field(..., min_length=1)
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     temperature: float = 0.7
     stream: bool = False  # accepted for compatibility; returns non-streamed
     models: Optional[list[str]] = None  # UI multi-select: rotation inhi models se
