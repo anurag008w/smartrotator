@@ -412,15 +412,19 @@ async def admin_models(request: Request):
     rotator: Rotator = request.app.state.rotator
     managed = await database.load_managed_config()
 
-    # provider state se: name, type, key count, configured models
+    # provider state se: name, type, key count, configured models + LIVE models
+    cache = _live_cache(request)
     providers = []
     for st in rotator.providers:
+        entry = cache.get(st.cfg.name) or {}
         providers.append(
             {
                 "name": st.cfg.name,
                 "type": st.cfg.ptype,
                 "key_count": len(st.cfg.keys),
                 "configured_models": list(st.cfg.models),
+                "live_models": [m["id"] for m in entry.get("models", [])],
+                "live_error": entry.get("error"),
             }
         )
     # providers jo config me hain par abhi incomplete (keys/models nahi) — bhi dikhao
@@ -1102,40 +1106,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- MODELS ADMIN -->
     <div class="view" id="view-models">
       <div class="card">
-        <h3 style="margin-bottom:4px">Model Manager</h3>
-        <div class="muted" style="margin-bottom:14px">Har provider ke active models select karo, order rakho, aur ek single model id (group) me sab daal do. Save → GitHub sync pe bhi push. 🔄</div>
+        <h3 style="margin-bottom:4px">Virtual Model Groups</h3>
+        <div class="muted" style="margin-bottom:10px">Group = ek model id jo multiple (provider, model) ko rotate karta hai. App bas group id bhejega (jaise "levelup"). Model dropdown me LIVE models dikhte hain — provider API se fetch hoke. 🔄</div>
         <div class="err" id="models-err"></div>
         <div class="ok" id="models-ok"></div>
-        <div id="provider-order-editor" style="margin-bottom:18px"></div>
-        <h3 style="margin:16px 0 10px">Virtual Model Groups</h3>
-        <div class="muted" style="margin-bottom:10px">Group = ek model id jo multiple (provider, model) ko rotate karta hai. App bas group id bhejega (jaise "levelup").</div>
+        <div style="margin:10px 0">
+          <button class="btn sec" onclick="refreshGroupLive()">🔄 Refresh Live Models</button>
+          <span class="muted" id="live-refresh-status" style="margin-left:10px"></span>
+        </div>
         <div id="group-editor"></div>
         <button class="btn sec" onclick="addGroup()" style="margin-top:10px">+ Add Group</button>
         <div style="height:18px"></div>
         <button class="btn" onclick="saveModels()">💾 Save Models Config</button>
-      </div>
-
-      <div class="card">
-        <h3 style="margin-bottom:4px">Custom Providers <span class="tag" style="color:var(--accent2)">LIVE models</span></h3>
-        <div class="muted" style="margin-bottom:12px">Apna provider add karo (Gemini ya OpenAI-compatible — mobile app jaisa). API keys daalo, "Fetch Live Models" se real models lao. 🚀</div>
-        <div class="err" id="prov-err"></div>
-        <div class="ok" id="prov-ok"></div>
-        <div id="custom-providers-list"></div>
-        <button class="btn sec" onclick="toggleProviderForm()" style="margin-top:10px" id="prov-add-btn">+ Add Provider</button>
-        <button class="btn sec" onclick="refreshAllLive()" style="margin-top:10px" id="prov-refresh-btn">🔄 Refresh All Live Models</button>
-        <div id="provider-form" style="display:none;margin-top:14px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px">
-          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-            <input id="pf-name" placeholder="name (jaise my-gemini)" style="flex:1;min-width:140px;padding:8px">
-            <select id="pf-type" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">
-              <option value="openai">OpenAI-compatible</option>
-              <option value="gemini">Gemini</option>
-            </select>
-          </div>
-          <input id="pf-base" placeholder="base URL (openai type ke liye zaroori, jaise https://api.openai.com/v1)" style="width:100%;padding:8px;margin-bottom:10px">
-          <textarea id="pf-keys" placeholder="API keys — ek line me ek (comma bhi chalega)" rows="2" style="width:100%;padding:8px;margin-bottom:10px"></textarea>
-          <input id="pf-models" placeholder="models (optional, comma separated) — khali chhodo toh fetch live se ayenge" style="width:100%;padding:8px;margin-bottom:10px">
-          <button class="btn" onclick="saveProvider()">💾 Save Provider</button>
-        </div>
       </div>
     </div>
   </div>
@@ -1377,127 +1359,30 @@ async function loadModelsAdmin() {
   if (!modelsDraft.provider_models) modelsDraft.provider_models = {};
   if (!modelsDraft.provider_order) modelsDraft.provider_order = [];
   if (!modelsDraft.groups) modelsDraft.groups = [];
-  renderOrderEditor();
   renderGroupEditor();
-  loadCustomProviders();
 }
 
-// ---------- custom providers (live models) ----------
-let customProviders = [];
-
-async function loadCustomProviders() {
-  const { res, data } = await api('/admin/providers');
-  if (!res.ok) return;
-  customProviders = data.providers || [];
-  renderCustomProviders();
-}
-
-function renderCustomProviders() {
-  const box = document.getElementById('custom-providers-list');
-  box.innerHTML = '';
-  if (customProviders.length === 0) {
-    box.innerHTML = '<div class="muted">Abhi koi custom provider nahi. "+ Add Provider" se jodo — jaise mobile app me. 😊</div>';
-    return;
-  }
-  customProviders.forEach(p => {
-    const card = document.createElement('div');
-    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:10px';
-    const modelsHtml = (p.models || []).map(m => `<span class="chip checked">${m}</span>`).join('') || '<span class="muted">koi models save nahi — Fetch Live karo</span>';
-    card.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">
-        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <strong>${p.name}</strong>
-          <span class="tag">${p.type}</span>
-          <span class="tag" style="color:var(--accent2)">🔑 ${p.key_count} key${p.key_count === 1 ? '' : 's'}</span>
-          ${p.enabled ? '' : '<span class="tag" style="color:var(--red)">disabled</span>'}
-          ${p.base_url ? `<span class="muted" style="font-size:11px">${p.base_url}</span>` : ''}
-        </div>
-        <div style="display:flex;gap:6px">
-          <button class="btn sec" style="padding:6px 10px" onclick="fetchLive('${p.name}')">⚡ Fetch Live Models</button>
-          <button class="btn danger" style="padding:6px 10px" onclick="deleteProvider('${p.name}')">🗑</button>
-        </div>
-      </div>
-      <div class="model-list">${modelsHtml}</div>
-      <div id="live-${p.name}" class="muted" style="margin-top:8px;font-size:12px"></div>`;
-    box.appendChild(card);
-  });
-}
-
-function toggleProviderForm() {
-  const f = document.getElementById('provider-form');
-  f.style.display = f.style.display === 'none' ? '' : 'none';
-  const b = document.getElementById('prov-add-btn');
-  b.textContent = f.style.display === 'none' ? '+ Add Provider' : '✕ Cancel';
-}
-
-function setProvMsg(text, ok) {
-  document.getElementById(ok ? 'prov-ok' : 'prov-err').textContent = text;
-  setTimeout(() => document.getElementById(ok ? 'prov-ok' : 'prov-err').textContent = '', 4000);
-}
-
-async function saveProvider() {
-  const name = document.getElementById('pf-name').value.trim();
-  if (!name) return setProvMsg('Provider name chahiye', false);
-  const keys = document.getElementById('pf-keys').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
-  if (keys.length === 0) return setProvMsg('Kam se kam ek API key chahiye', false);
-  const models = document.getElementById('pf-models').value.split(',').map(s => s.trim()).filter(Boolean);
-  const body = {
-    name,
-    type: document.getElementById('pf-type').value,
-    base_url: document.getElementById('pf-base').value.trim(),
-    api_keys: keys,
-    models,
-    enabled: true,
-  };
-  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
-  if (!res.ok) return setProvMsg(data.detail || 'Add failed', false);
-  setProvMsg('✅ ' + (data.message || 'Saved') + (data.live && data.live.length ? ` — ${data.live.length} live models mile!` : ''), true);
-  document.getElementById('pf-name').value = '';
-  document.getElementById('pf-keys').value = '';
-  document.getElementById('pf-models').value = '';
-  toggleProviderForm();
-  loadCustomProviders();
-  loadModelsAdminData();
-}
-
-async function deleteProvider(name) {
-  if (!confirm('Provider "' + name + '" delete karna? Chat me use ho raha hoga toh woh models bhi hatenge.')) return;
-  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name), { method: 'DELETE' });
-  if (!res.ok) return setProvMsg(data.detail || 'Delete failed', false);
-  setProvMsg('✅ ' + (data.message || 'Deleted'), true);
-  loadCustomProviders();
-}
-
-async function fetchLive(name) {
-  const el = document.getElementById('live-' + name);
-  el.textContent = '⏳ live models fetch ho rahe hain…';
-  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name) + '/fetch-models', { method: 'POST' });
-  if (!res.ok) {
-    el.textContent = '❌ ' + (data.detail || 'Failed');
-    return;
-  }
-  const models = data.models || [];
-  el.innerHTML = '⚡ <b>' + models.length + '</b> live models: ' +
-    models.map(m => `<span class="chip checked" style="cursor:pointer" title="${m.name || m.id}" onclick="addLiveModel('${name}', '${(m.id || '').replace(/'/g, "\\'")}')">${m.id}</span>`).join('');
-  setProvMsg('✅ Live models aa gaye! Model pe click karo = custom model add. Ya Refresh All se sab refresh.', true);
-}
-
-async function refreshAllLive() {
-  const btn = document.getElementById('prov-refresh-btn');
-  btn.disabled = true; btn.textContent = '⏳ refreshing…';
+// ---------- live models (group editor) ----------
+async function refreshGroupLive() {
+  const st = document.getElementById('live-refresh-status');
+  const btn = document.querySelector('button[onclick="refreshGroupLive()"]');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ refreshing…'; }
+  if (st) st.textContent = '';
   const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
-  btn.disabled = false; btn.textContent = '🔄 Refresh All Live Models';
-  if (!res.ok) { setProvMsg(data.detail || 'Failed', false); return; }
-  const lines = (data.results || []).map(r => `${r.name}: ${r.count} models${r.error ? ' (❌ ' + r.error + ')' : ''}`).join('<br>');
-  setProvMsg('✅ Sab refresh: <br>' + lines, true);
+  if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh Live Models'; }
+  if (!res.ok) { if (st) st.textContent = '❌ ' + (data.detail || 'Failed'); return; }
+  const lines = (data.results || []).map(r => `${r.name}: ${r.count}${r.error ? ' (❌ ' + r.error + ')' : ''}`).join(' · ');
+  if (st) st.textContent = '✅ ' + lines;
+  await loadModelsAdminData();
 }
 
-function addLiveModel(provider, model) {
-  // live model ko us provider ke selected models me daal do (modelsDraft)
-  if (!modelsDraft.provider_models[provider]) modelsDraft.provider_models[provider] = [];
-  if (!modelsDraft.provider_models[provider].includes(model)) modelsDraft.provider_models[provider].push(model);
-  setProvMsg('✅ "' + model + '" ' + provider + ' ke models me add ho gaya — "Save Models Config" dabao!', true);
-  renderOrderEditor();
+// provider ke saare possible models: LIVE (API se) + catalog + configured
+function providerModelOptions(providerName) {
+  const pInfo = modelsData.providers.find(p => p.name === providerName);
+  const liveModels = (pInfo && pInfo.live_models) || [];
+  const catalogModels = (modelsData.catalog && modelsData.catalog[providerName]) || [];
+  const configured = (pInfo && pInfo.configured_models) || [];
+  return Array.from(new Set(liveModels.concat(catalogModels).concat(configured)));
 }
 
 async function loadModelsAdminData() {
@@ -1508,75 +1393,7 @@ async function loadModelsAdminData() {
   if (!modelsDraft.provider_models) modelsDraft.provider_models = {};
   if (!modelsDraft.provider_order) modelsDraft.provider_order = [];
   if (!modelsDraft.groups) modelsDraft.groups = [];
-  renderOrderEditor();
   renderGroupEditor();
-}
-
-function renderOrderEditor() {
-  const box = document.getElementById('provider-order-editor');
-  const provs = modelsData.providers;
-  // order: draft order first, phir baaki providers
-  const ordered = modelsDraft.provider_order.concat(provs.map(p => p.name).filter(n => !modelsDraft.provider_order.includes(n)));
-  box.innerHTML = '<h3 style="margin-bottom:10px">Provider Order & Models</h3>';
-  ordered.forEach((name, idx) => {
-    const p = provs.find(x => x.name === name);
-    if (!p) return;
-    const selected = modelsDraft.provider_models[name] || [];
-    const catalogModels = (modelsData.catalog && modelsData.catalog[name]) || [];
-    // union: catalog + currently selected (custom models bhi rakh lo)
-    const allModels = Array.from(new Set(catalogModels.concat(p.configured_models || []).concat(selected)));
-    const card = document.createElement('div');
-    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px';
-    const keyCount = p.key_count || 0;
-    let chips = '';
-    allModels.forEach(m => {
-      const on = selected.includes(m);
-      chips += `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer" onclick="toggleModel('${name}', '${m.replace(/'/g, "\\'")}')"><input type="checkbox" ${on ? 'checked' : ''}>${m}</label>`;
-    });
-    card.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <button class="btn sec" style="padding:4px 10px" onclick="moveProvider(${idx}, -1)">⬆</button>
-          <button class="btn sec" style="padding:4px 10px" onclick="moveProvider(${idx}, 1)">⬇</button>
-          <strong>${name}</strong>
-          <span class="tag">${p.type}</span>
-          <span class="tag" style="color:var(--accent2)">🔑 ${keyCount} key${keyCount === 1 ? '' : 's'}</span>
-        </div>
-      </div>
-      <div class="model-list">${chips}</div>
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <input placeholder="custom model id add karo…" onkeydown="if(event.key==='Enter')addCustomModel('${name}', this.value); this.value=''" style="padding:8px;font-size:13px">
-        <button class="btn sec" style="padding:8px 14px" onclick="addCustomModel('${name}', this.previousElementSibling.value); this.previousElementSibling.value=''">+</button>
-      </div>`;
-    box.appendChild(card);
-  });
-}
-
-function moveProvider(idx, dir) {
-  const provs = modelsData.providers;
-  const ordered = modelsDraft.provider_order.concat(provs.map(p => p.name).filter(n => !modelsDraft.provider_order.includes(n)));
-  const j = idx + dir;
-  if (j < 0 || j >= ordered.length) return;
-  [ordered[idx], ordered[j]] = [ordered[j], ordered[idx]];
-  modelsDraft.provider_order = ordered.filter(n => provs.some(p => p.name === n));
-  renderOrderEditor();
-}
-
-function toggleModel(provider, model) {
-  const list = modelsDraft.provider_models[provider] || [];
-  const i = list.indexOf(model);
-  if (i >= 0) list.splice(i, 1); else list.push(model);
-  modelsDraft.provider_models[provider] = list;
-  renderOrderEditor();
-}
-
-function addCustomModel(provider, model) {
-  const m = (model || '').trim();
-  if (!m) return;
-  const list = modelsDraft.provider_models[provider] || [];
-  if (!list.includes(m)) list.push(m);
-  modelsDraft.provider_models[provider] = list;
-  renderOrderEditor();
 }
 
 function renderGroupEditor() {
@@ -1588,9 +1405,8 @@ function renderGroupEditor() {
     let membersHtml = '';
     g.members.forEach((m, mi) => {
       const provOpts = modelsData.providers.map(p => `<option value="${p.name}" ${p.name === m.provider ? 'selected' : ''}>${p.name}</option>`).join('');
-      const pInfo = modelsData.providers.find(p => p.name === m.provider);
-      const availableModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[m.provider]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
-      const modelOpts = availableModels.map(mm => `<option value="${mm}" ${mm === m.model ? 'selected' : ''}>${mm}</option>`).join('');
+      const availableModels = providerModelOptions(m.provider);
+      const modelOpts = availableModels.map(mm => `<option value="${mm}" ${mm === m.model ? 'selected' : ''}>${mm}</option>`).join('') || '<option value="">(live models khali — Refresh karo)</option>';
       membersHtml += `<div style="display:flex;gap:8px;margin-top:8px">
         <select onchange="updateMember(${gi}, ${mi}, 'provider', this.value)" style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
         <select onchange="updateMember(${gi}, ${mi}, 'model', this.value)" style="flex:2;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${modelOpts}</select>
@@ -1620,28 +1436,38 @@ function addGroup() {
 function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); renderGroupEditor(); }
 function addMember(gi) {
   const prov = modelsData.providers[0] || { name: '' };
-  const pInfo = modelsData.providers.find(p => p.name === prov.name);
-  const catalogModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[prov.name]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
-  modelsDraft.groups[gi].members.push({ provider: prov.name, model: catalogModels[0] || '' });
+  const opts = providerModelOptions(prov.name);
+  modelsDraft.groups[gi].members.push({ provider: prov.name, model: opts[0] || '' });
   renderGroupEditor();
 }
 function updateMember(gi, mi, key, val) {
   modelsDraft.groups[gi].members[mi][key] = val;
   if (key === 'provider') {
-    // provider badla → model reset karo
-    const pInfo = modelsData.providers.find(p => p.name === val);
-    const catalogModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[val]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
-    modelsDraft.groups[gi].members[mi].model = catalogModels[0] || '';
+    // provider badla → model reset karo (live models me se pehla)
+    const opts = providerModelOptions(val);
+    modelsDraft.groups[gi].members[mi].model = opts[0] || '';
     renderGroupEditor();
   }
 }
 
 async function saveModels() {
+  // enabled groups ke members se provider_models + provider_order auto-banao
+  const provider_models = {};
+  const provider_order = [];
+  modelsDraft.groups.forEach(g => {
+    if (!g.enabled) return;
+    g.members.forEach(m => {
+      if (!m.provider || !m.model) return;
+      if (!provider_models[m.provider]) provider_models[m.provider] = [];
+      if (!provider_models[m.provider].includes(m.model)) provider_models[m.provider].push(m.model);
+      if (!provider_order.includes(m.provider)) provider_order.push(m.provider);
+    });
+  });
   const { res, data } = await api('/admin/models', {
     method: 'PUT',
     body: JSON.stringify({
-      provider_models: modelsDraft.provider_models,
-      provider_order: modelsDraft.provider_order,
+      provider_models,
+      provider_order,
       groups: modelsDraft.groups,
     })
   });
