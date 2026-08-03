@@ -1371,7 +1371,7 @@ function setProvMsg(text, ok) {
 async function saveProvider() {
   const name = document.getElementById('pf-name').value.trim();
   if (!name) return setProvMsg('Provider name chahiye', false);
-  const keys = document.getElementById('pf-keys').value.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  const keys = document.getElementById('pf-keys').value.split(/[\\n,]/).map(s => s.trim()).filter(Boolean);
   if (keys.length === 0) return setProvMsg('Kam se kam ek API key chahiye', false);
   const models = document.getElementById('pf-models').value.split(',').map(s => s.trim()).filter(Boolean);
   const body = {
