@@ -325,14 +325,22 @@ class Rotator:
     # Public API
     # ------------------------------------------------------------------
     def models(self) -> list[dict]:
-        """List all configured models per provider + virtual model groups."""
+        """List all configured models per provider + virtual model groups.
+        Virtual model groups (LevelUp ke "levelup" jaise) top pe aate hain —
+        mobile app ka model picker inhe sabse pehle dikhata hai. Sirf wahi
+        providers dikhte hain jinme kam se kam ek API key configured hai —
+        bina key wale providers ke models select karne pe fail karte hain."""
         out = []
-        for st in self.providers:
-            for m in st.cfg.models:
-                out.append({"provider": st.cfg.name, "id": m, "type": st.cfg.ptype})
+        # 1. virtual model groups — sabse upar (app ke default models)
         for g in self.groups:
             if g["enabled"]:
                 out.append({"provider": "smartrotator", "id": g["id"], "type": "group"})
+        # 2. provider models — groups ke baad (sirf key-configured providers)
+        for st in self.providers:
+            if not st.cfg.keys:
+                continue
+            for m in st.cfg.models:
+                out.append({"provider": st.cfg.name, "id": m, "type": st.cfg.ptype})
         return out
 
     def _build_proxy_pool(self, pcfg: dict) -> ProxyPool:
