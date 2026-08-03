@@ -45,14 +45,7 @@ services:
     name: smartrotator-db
     plan: free
 
-  # Keep-alive: har 10 min me ping (free tier sleep na ho)
-  - type: cron
-    name: smartrotator-keepalive
-    runtime: python
-    plan: free
-    schedule: "*/10 * * * *"
-    buildCommand: ""
-    startCommand: python keepalive.py
-    envVars:
-      - key: PING_URL
-        value: https://smartrotator.onrender.com/health
+  # Keep-alive: cron-job.org pe banaya hai (jobId 8205944) — har 10 min me
+  # https://smartrotator.onrender.com/health ping (free tier sleep na ho).
+  # Render ka paid cron plan nahi chahiye isliye bahar ka scheduler use kar rahe hain.
+  # NOTE: Blueprint se deploy karte waqt yeh cron block hata dena (paid plan chahiye).
