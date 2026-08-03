@@ -122,6 +122,20 @@ app = FastAPI(
 )
 
 
+# CORS: the LevelUp mobile/web app calls this server directly (login + /v1
+# gateway). Native apps bypass CORS, but the web preview needs permissive
+# headers. Auth is enforced by JWT/sk- keys, so a wildcard origin is fine.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def _auth_settings() -> dict:
     cfg = _load_config().get("auth", {}) or {}
     secret = os.environ.get(cfg.get("jwt_secret_env", "JWT_SECRET"), cfg.get("jwt_secret", ""))
