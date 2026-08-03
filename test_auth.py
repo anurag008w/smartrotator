@@ -7,12 +7,15 @@ Run:  python test_auth.py
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 
-# IMPORTANT: db import se pehle test db set karo
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_auth.db"
-if os.path.exists("test_auth.db"):
-    os.remove("test_auth.db")
+# IMPORTANT: store import se pehle test data dir set karo
+TEST_DATA_DIR = "./test_data_auth"
+os.environ["SMARTROTATOR_DATA_DIR"] = TEST_DATA_DIR
+os.environ["GITHUB_SYNC_ENABLED"] = "false"
+if os.path.exists(TEST_DATA_DIR):
+    shutil.rmtree(TEST_DATA_DIR)
 
 from starlette.testclient import TestClient  # noqa: E402
 
@@ -77,15 +80,10 @@ def main() -> int:
         # manually bump usage to limit
         import asyncio
 
-        from rotator import db as database
+        from rotator import store as database
 
         async def bump():
-            async with database.get_session() as db:
-                from rotator.db import get_usage_row
-
-                row = await get_usage_row(db, alice["user"]["id"], database.today_utc())
-                row.requests = alice["user"]["daily_limit"]
-                await db.commit()
+            await database.set_usage(alice["user"]["id"], database.today_utc(), alice["user"]["daily_limit"])
 
         asyncio.run(bump())
         r = client.post(
@@ -132,8 +130,8 @@ def main() -> int:
         print(f"{name:<40} {mark:<12} {extra}")
     print("-" * 68)
     print(f"{passed}/{len(results)} passed")
-    if os.path.exists("test_auth.db"):
-        os.remove("test_auth.db")
+    if os.path.exists(TEST_DATA_DIR):
+        shutil.rmtree(TEST_DATA_DIR)
     return 0 if passed == len(results) else 1
 
 

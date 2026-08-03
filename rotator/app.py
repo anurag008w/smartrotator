@@ -26,6 +26,7 @@ Admin:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -37,7 +38,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import db as database
+from . import github_sync
+from . import store as database
+from .catalog import MODEL_CATALOG
 from .auth import (
     create_jwt,
     decode_jwt,
@@ -72,10 +75,35 @@ def _load_config() -> dict:
 async def lifespan(app: FastAPI):
     rotator = Rotator(config_path=CONFIG_PATH)
     app.state.rotator = rotator
+
+    # 1) GitHub sync: restart pe PEHLE pull (data restore, DB ki zaroorat nahi)
+    await asyncio.to_thread(github_sync.pull_data)
+
+    # 2) JSON store load karo (users + usage + managed config)
     await database.init_db()
+
+    # 3) Model Manager: dashboard ka saved config (models/groups/order) apply karo
+    managed = await database.load_managed_config()
+    rotator.apply_managed(managed)
+
+    # 4) background sync task — har 3 min me data change ho toh push
+    stop_event = asyncio.Event()
+    sync_task = asyncio.create_task(github_sync.sync_loop(stop_event))
+    app.state.github_sync_task = sync_task
+    app.state.github_sync_stop = stop_event
+
     yield
+
+    stop_event.set()
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
+    # shutdown se pehle ek aakhri push (latest data GitHub pe)
+    if github_sync.is_enabled():
+        await asyncio.to_thread(github_sync.push_data)
     await rotator.aclose()
-    await database.engine.dispose()
 
 
 app = FastAPI(
@@ -135,6 +163,24 @@ class SetLimitRequest(BaseModel):
     daily_limit: int = Field(..., ge=1, le=100000)
 
 
+class GroupMember(BaseModel):
+    provider: str
+    model: str
+
+
+class ModelGroupInput(BaseModel):
+    id: str = Field(..., min_length=1, max_length=64)
+    label: str = ""
+    enabled: bool = True
+    members: list[GroupMember] = []
+
+
+class SaveModelsRequest(BaseModel):
+    provider_models: dict[str, list[str]] = {}
+    provider_order: list[str] = []
+    groups: list[ModelGroupInput] = []
+
+
 # --------------------------------------------------------------------------
 # Public endpoints
 # --------------------------------------------------------------------------
@@ -170,32 +216,30 @@ async def register(req: RegisterRequest):
     if not settings["enabled"]:
         raise HTTPException(status_code=403, detail="Auth disabled")
 
-    async with database.get_session() as db:
-        existing = await database.get_user_by_username(db, req.username)
-        if existing:
-            raise HTTPException(status_code=409, detail="Username already taken")
+    existing = await database.get_user_by_username(req.username)
+    if existing:
+        raise HTTPException(status_code=409, detail="Username already taken")
 
-        # first user = admin (self-hosted pattern)
-        count = await _count_users(db)
-        role = "admin" if count == 0 else "user"
-        if req.username in settings["admin_usernames"]:
-            role = "admin"
+    # first user = admin (self-hosted pattern)
+    count = await database.count_users()
+    role = "admin" if count == 0 else "user"
+    if req.username in settings["admin_usernames"]:
+        role = "admin"
 
-        password_hash, salt = hash_password(req.password)
-        user = await database.create_user(
-            db,
-            username=req.username,
-            password_hash=password_hash,
-            salt=salt,
-            api_key=generate_api_key(),
-            daily_limit=settings["default_daily_limit"],
-            role=role,
-        )
+    password_hash, salt = hash_password(req.password)
+    user = await database.create_user(
+        username=req.username,
+        password_hash=password_hash,
+        salt=salt,
+        api_key=generate_api_key(),
+        daily_limit=settings["default_daily_limit"],
+        role=role,
+    )
 
-        token = create_jwt(
-            user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
-        )
-        return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
+    token = create_jwt(
+        user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
+    )
+    return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
 
 
 @app.post("/auth/login")
@@ -204,48 +248,41 @@ async def login(req: LoginRequest):
     if not settings["enabled"]:
         raise HTTPException(status_code=403, detail="Auth disabled")
 
-    async with database.get_session() as db:
-        user = await database.get_user_by_username(db, req.username)
-        if not user or not verify_password(req.password, user.password_hash, user.salt):
-            raise HTTPException(status_code=401, detail="Invalid username or password")
+    user = await database.get_user_by_username(req.username)
+    if not user or not verify_password(req.password, user.password_hash, user.salt):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
-        token = create_jwt(
-            user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
-        )
-        return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
+    token = create_jwt(
+        user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
+    )
+    return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
 
 
 @app.get("/auth/me")
 async def auth_me(request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
-    async with database.get_session() as db:
-        today = database.today_utc()
-        row = await database.get_usage_row(db, user.id, today)
-        history = await database.get_usage_between(db, user.id, 7)
-        return {
-            "user": _user_public(user),
-            "api_key": user.api_key,
-            "today": {"day": today, "requests": row.requests, "tokens": row.tokens},
-            "history": [
-                {"day": h.day, "requests": h.requests, "tokens": h.tokens} for h in history
-            ],
-        }
+    today = database.today_utc()
+    row = await database.get_usage_row(user.id, today)
+    history = await database.get_usage_between(user.id, 7)
+    return {
+        "user": _user_public(user),
+        "api_key": user.api_key,
+        "today": {"day": today, "requests": row.requests, "tokens": row.tokens},
+        "history": [
+            {"day": h.day, "requests": h.requests, "tokens": h.tokens} for h in history
+        ],
+    }
 
 
 @app.post("/auth/rotate-key")
 async def rotate_key(request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
-    async with database.get_session() as db:
-        # naye session me fresh user fetch karo (purana detached ho sakta hai)
-        db_user = await database.get_user_by_id(db, user.id)
-        if db_user is None:
-            raise HTTPException(status_code=404, detail="User not found")
-        db_user.api_key = generate_api_key()
-        await db.commit()
-        await db.refresh(db_user)
-        return {"api_key": db_user.api_key}
+    db_user = await database.rotate_api_key(user.id, generate_api_key())
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"api_key": db_user.api_key}
 
 
 # --------------------------------------------------------------------------
@@ -258,25 +295,23 @@ async def admin_users(request: Request):
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
-    async with database.get_session() as db:
-        result = await db.execute(database.select(database.User).order_by(database.User.id))
-        users = list(result.scalars())
-        today = database.today_utc()
-        out = []
-        for u in users:
-            row = await database.get_usage_row(db, u.id, today)
-            out.append(
-                {
-                    "id": u.id,
-                    "username": u.username,
-                    "role": u.role,
-                    "api_key": u.api_key[:14] + "...",
-                    "daily_limit": u.daily_limit,
-                    "today_requests": row.requests,
-                    "created_at": u.created_at,
-                }
-            )
-        return {"users": out}
+    users = await database.list_users()
+    today = database.today_utc()
+    out = []
+    for u in users:
+        row = await database.get_usage_row(u.id, today)
+        out.append(
+            {
+                "id": u.id,
+                "username": u.username,
+                "role": u.role,
+                "api_key": u.api_key[:14] + "...",
+                "daily_limit": u.daily_limit,
+                "today_requests": row.requests,
+                "created_at": u.created_at,
+            }
+        )
+    return {"users": out}
 
 
 @app.post("/admin/users/{user_id}/limit")
@@ -286,13 +321,89 @@ async def admin_set_limit(user_id: int, req: SetLimitRequest, request: Request):
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Admin only")
 
-    async with database.get_session() as db:
-        target = await database.get_user_by_id(db, user_id)
-        if not target:
-            raise HTTPException(status_code=404, detail="User not found")
-        target.daily_limit = req.daily_limit
-        await db.commit()
-        return {"ok": True, "username": target.username, "daily_limit": target.daily_limit}
+    target = await database.set_daily_limit(user_id, req.daily_limit)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True, "username": target.username, "daily_limit": target.daily_limit}
+
+
+# --------------------------------------------------------------------------
+# Model Manager admin endpoints (dashboard Models tab)
+# --------------------------------------------------------------------------
+async def _require_admin(request: Request):
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
+@app.get("/admin/models")
+async def admin_models(request: Request):
+    """Dashboard ke liye: catalog + current managed config + provider/key counts."""
+    await _require_admin(request)
+
+    rotator: Rotator = request.app.state.rotator
+    managed = await database.load_managed_config()
+
+    # provider state se: name, type, key count, configured models
+    providers = []
+    for st in rotator.providers:
+        providers.append(
+            {
+                "name": st.cfg.name,
+                "type": st.cfg.ptype,
+                "key_count": len(st.cfg.keys),
+                "configured_models": list(st.cfg.models),
+            }
+        )
+    # providers jo config me hain par abhi incomplete (keys/models nahi) — bhi dikhao
+    raw_cfg = _load_config().get("providers", [])
+    known = {p["name"] for p in providers}
+    for p in raw_cfg:
+        name = p.get("name", "")
+        if name not in known:
+            providers.append(
+                {
+                    "name": name,
+                    "type": p.get("type", "openai"),
+                    "key_count": 0,
+                    "configured_models": [m for m in p.get("models", []) if not str(m).startswith("PASTE_")],
+                }
+            )
+
+    return {
+        "catalog": MODEL_CATALOG,
+        "managed": managed,
+        "providers": providers,
+        "default_model": rotator.default_model,
+    }
+
+
+@app.put("/admin/models")
+async def admin_save_models(req: SaveModelsRequest, request: Request):
+    """Dashboard se save — models/groups/order apply karo (config.yaml touch nahi)."""
+    await _require_admin(request)
+
+    # groups ko pydantic → plain dicts
+    groups = [
+        {
+            "id": g.id,
+            "label": g.label or g.id,
+            "enabled": g.enabled,
+            "members": [{"provider": m.provider, "model": m.model} for m in g.members],
+        }
+        for g in req.groups
+    ]
+    await database.save_managed_config(
+        provider_models=req.provider_models,
+        provider_order=req.provider_order,
+        groups=groups,
+    )
+
+    rotator: Rotator = request.app.state.rotator
+    rotator.apply_managed(await database.load_managed_config())
+    return {"ok": True, "message": "Models config save + apply ho gayi"}
 
 
 # --------------------------------------------------------------------------
@@ -413,13 +524,12 @@ async def _authenticate(request: Request, settings: dict):
         return None
     token = auth[7:].strip()
 
-    async with database.get_session() as db:
-        if is_user_api_key(token):
-            return await database.get_user_by_api_key(db, token)
-        payload = decode_jwt(token, settings["jwt_secret"])
-        if payload:
-            return await database.get_user_by_id(db, int(payload["sub"]))
-        return None
+    if is_user_api_key(token):
+        return await database.get_user_by_api_key(token)
+    payload = decode_jwt(token, settings["jwt_secret"])
+    if payload:
+        return await database.get_user_by_id(int(payload["sub"]))
+    return None
 
 
 async def _require_user(request: Request, settings: dict):
@@ -429,36 +539,18 @@ async def _require_user(request: Request, settings: dict):
     return user
 
 
-async def _count_users(db) -> int:
-    result = await db.execute(database.select(database.User.id))
-    return len(result.all())
-
-
 async def _reserve_quota(user) -> bool:
     """Request reserve karo — quota bacha hai toh True."""
-    async with database.get_session() as db:
-        row = await database.get_usage_row(db, user.id, database.today_utc())
-        if row.requests >= user.daily_limit:
-            return False
-        row.requests += 1
-        await db.commit()
-        return True
+    return await database.reserve_quota(user.id, database.today_utc(), user.daily_limit)
 
 
 async def _refund_quota(user) -> None:
     """Fail ho gaya toh reserved request wapas de do."""
-    async with database.get_session() as db:
-        row = await database.get_usage_row(db, user.id, database.today_utc())
-        if row.requests > 0:
-            row.requests -= 1
-            await db.commit()
+    await database.refund_quota(user.id, database.today_utc())
 
 
 async def _record_tokens(user, tokens: int) -> None:
-    async with database.get_session() as db:
-        row = await database.get_usage_row(db, user.id, database.today_utc())
-        row.tokens += tokens
-        await db.commit()
+    await database.record_tokens(user.id, database.today_utc(), int(tokens))
 
 
 def _user_public(user) -> dict:
@@ -627,6 +719,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="tab" onclick="showView('usage'); loadMe();">📊 Usage</div>
       <div class="tab" onclick="showView('settings')">⚙️ Settings</div>
       <div class="tab" id="adminTab" style="display:none" onclick="showView('admin'); loadAdmin();">🛡 Admin</div>
+      <div class="tab" id="modelsTab" style="display:none" onclick="showView('models'); loadModelsAdmin();">🧠 Models</div>
     </div>
 
     <!-- CHAT -->
@@ -701,6 +794,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </table></div>
       </div>
     </div>
+
+    <!-- MODELS ADMIN -->
+    <div class="view" id="view-models">
+      <div class="card">
+        <h3 style="margin-bottom:4px">Model Manager</h3>
+        <div class="muted" style="margin-bottom:14px">Har provider ke active models select karo, order rakho, aur ek single model id (group) me sab daal do. Save → GitHub sync pe bhi push. 🔄</div>
+        <div class="err" id="models-err"></div>
+        <div class="ok" id="models-ok"></div>
+        <div id="provider-order-editor" style="margin-bottom:18px"></div>
+        <h3 style="margin:16px 0 10px">Virtual Model Groups</h3>
+        <div class="muted" style="margin-bottom:10px">Group = ek model id jo multiple (provider, model) ko rotate karta hai. App bas group id bhejega (jaise "levelup").</div>
+        <div id="group-editor"></div>
+        <button class="btn sec" onclick="addGroup()" style="margin-top:10px">+ Add Group</button>
+        <div style="height:18px"></div>
+        <button class="btn" onclick="saveModels()">💾 Save Models Config</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -729,7 +839,7 @@ function showMain(user) {
   document.getElementById('view-auth').style.display = 'none';
   document.getElementById('view-main').style.display = 'block';
   document.getElementById('userChip').textContent = '👤 ' + user.username + (user.role === 'admin' ? ' ⭐ admin' : '');
-  if (user.role === 'admin') document.getElementById('adminTab').style.display = '';
+  if (user.role === 'admin') { document.getElementById('adminTab').style.display = ''; document.getElementById('modelsTab').style.display = ''; }
 }
 function authTab(which) {
   document.getElementById('tab-login').classList.toggle('active', which === 'login');
@@ -910,6 +1020,161 @@ async function loadAdmin() {
 async function setLimit(id, value) {
   const { res, data } = await api('/admin/users/' + id + '/limit', { method: 'POST', body: JSON.stringify({ daily_limit: parseInt(value) }) });
   if (!res.ok) alert(data.detail || 'Failed');
+}
+
+// ---------- models admin ----------
+let modelsData = null;  // {catalog, managed, providers, default_model}
+let modelsDraft = null; // working copy
+
+async function loadModelsAdmin() {
+  const { res, data } = await api('/admin/models');
+  if (!res.ok) { document.getElementById('models-err').textContent = data.detail || 'Failed'; return; }
+  modelsData = data;
+  modelsDraft = JSON.parse(JSON.stringify(data.managed));  // deep copy
+  if (!modelsDraft.provider_models) modelsDraft.provider_models = {};
+  if (!modelsDraft.provider_order) modelsDraft.provider_order = [];
+  if (!modelsDraft.groups) modelsDraft.groups = [];
+  renderOrderEditor();
+  renderGroupEditor();
+}
+
+function renderOrderEditor() {
+  const box = document.getElementById('provider-order-editor');
+  const provs = modelsData.providers;
+  // order: draft order first, phir baaki providers
+  const ordered = modelsDraft.provider_order.concat(provs.map(p => p.name).filter(n => !modelsDraft.provider_order.includes(n)));
+  box.innerHTML = '<h3 style="margin-bottom:10px">Provider Order & Models</h3>';
+  ordered.forEach((name, idx) => {
+    const p = provs.find(x => x.name === name);
+    if (!p) return;
+    const selected = modelsDraft.provider_models[name] || [];
+    const catalogModels = (modelsData.catalog && modelsData.catalog[name]) || [];
+    // union: catalog + currently selected (custom models bhi rakh lo)
+    const allModels = Array.from(new Set(catalogModels.concat(p.configured_models || []).concat(selected)));
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px';
+    const keyCount = p.key_count || 0;
+    let chips = '';
+    allModels.forEach(m => {
+      const on = selected.includes(m);
+      chips += `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer" onclick="toggleModel('${name}', '${m.replace(/'/g, "\\'")}')"><input type="checkbox" ${on ? 'checked' : ''}>${m}</label>`;
+    });
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <button class="btn sec" style="padding:4px 10px" onclick="moveProvider(${idx}, -1)">⬆</button>
+          <button class="btn sec" style="padding:4px 10px" onclick="moveProvider(${idx}, 1)">⬇</button>
+          <strong>${name}</strong>
+          <span class="tag">${p.type}</span>
+          <span class="tag" style="color:var(--accent2)">🔑 ${keyCount} key${keyCount === 1 ? '' : 's'}</span>
+        </div>
+      </div>
+      <div class="model-list">${chips}</div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <input placeholder="custom model id add karo…" onkeydown="if(event.key==='Enter')addCustomModel('${name}', this.value); this.value=''" style="padding:8px;font-size:13px">
+        <button class="btn sec" style="padding:8px 14px" onclick="addCustomModel('${name}', this.previousElementSibling.value); this.previousElementSibling.value=''">+</button>
+      </div>`;
+    box.appendChild(card);
+  });
+}
+
+function moveProvider(idx, dir) {
+  const provs = modelsData.providers;
+  const ordered = modelsDraft.provider_order.concat(provs.map(p => p.name).filter(n => !modelsDraft.provider_order.includes(n)));
+  const j = idx + dir;
+  if (j < 0 || j >= ordered.length) return;
+  [ordered[idx], ordered[j]] = [ordered[j], ordered[idx]];
+  modelsDraft.provider_order = ordered.filter(n => provs.some(p => p.name === n));
+  renderOrderEditor();
+}
+
+function toggleModel(provider, model) {
+  const list = modelsDraft.provider_models[provider] || [];
+  const i = list.indexOf(model);
+  if (i >= 0) list.splice(i, 1); else list.push(model);
+  modelsDraft.provider_models[provider] = list;
+  renderOrderEditor();
+}
+
+function addCustomModel(provider, model) {
+  const m = (model || '').trim();
+  if (!m) return;
+  const list = modelsDraft.provider_models[provider] || [];
+  if (!list.includes(m)) list.push(m);
+  modelsDraft.provider_models[provider] = list;
+  renderOrderEditor();
+}
+
+function renderGroupEditor() {
+  const box = document.getElementById('group-editor');
+  box.innerHTML = '';
+  modelsDraft.groups.forEach((g, gi) => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:10px';
+    let membersHtml = '';
+    g.members.forEach((m, mi) => {
+      const provOpts = modelsData.providers.map(p => `<option value="${p.name}" ${p.name === m.provider ? 'selected' : ''}>${p.name}</option>`).join('');
+      const availableModels = (modelsData.catalog && modelsData.catalog[m.provider]) || [];
+      const modelOpts = availableModels.map(mm => `<option value="${mm}" ${mm === m.model ? 'selected' : ''}>${mm}</option>`).join('');
+      membersHtml += `<div style="display:flex;gap:8px;margin-top:8px">
+        <select onchange="updateMember(${gi}, ${mi}, 'provider', this.value)" style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
+        <select onchange="updateMember(${gi}, ${mi}, 'model', this.value)" style="flex:2;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${modelOpts}</select>
+        <button class="btn sec" style="padding:4px 10px" onclick="removeMember(${gi}, ${mi})">✕</button>
+      </div>`;
+    });
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <input value="${g.id}" placeholder="group id (jaise levelup)" style="flex:1;min-width:140px;padding:8px" onchange="updateGroup(${gi}, 'id', this.value)">
+        <input value="${g.label || ''}" placeholder="label" style="flex:1;min-width:100px;padding:8px" onchange="updateGroup(${gi}, 'label', this.value)">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px"><input type="checkbox" ${g.enabled ? 'checked' : ''} onchange="updateGroup(${gi}, 'enabled', this.checked)">enabled</label>
+        <button class="btn danger" style="padding:6px 12px" onclick="removeGroup(${gi})">🗑 Delete</button>
+      </div>
+      <div style="margin-top:8px">${membersHtml}</div>
+      <button class="btn sec" style="padding:6px 12px;margin-top:10px" onclick="addMember(${gi})">+ Member</button>
+      <div class="muted" style="margin-top:6px;font-size:12px">App bhejega: model = "<b>${g.id || 'levelup'}</b>" → server members me rotate karega</div>`;
+    box.appendChild(card);
+  });
+}
+
+function updateGroup(gi, key, val) { modelsDraft.groups[gi][key] = val; }
+function removeGroup(gi) { modelsDraft.groups.splice(gi, 1); renderGroupEditor(); }
+function addGroup() {
+  modelsDraft.groups.push({ id: 'levelup', label: 'LevelUp', enabled: true, members: [] });
+  renderGroupEditor();
+}
+function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); renderGroupEditor(); }
+function addMember(gi) {
+  const prov = modelsData.providers[0] || { name: '' };
+  const catalogModels = (modelsData.catalog && modelsData.catalog[prov.name]) || [];
+  modelsDraft.groups[gi].members.push({ provider: prov.name, model: catalogModels[0] || '' });
+  renderGroupEditor();
+}
+function updateMember(gi, mi, key, val) {
+  modelsDraft.groups[gi].members[mi][key] = val;
+  if (key === 'provider') {
+    // provider badla → model reset karo
+    const catalogModels = (modelsData.catalog && modelsData.catalog[val]) || [];
+    modelsDraft.groups[gi].members[mi].model = catalogModels[0] || '';
+    renderGroupEditor();
+  }
+}
+
+async function saveModels() {
+  const { res, data } = await api('/admin/models', {
+    method: 'PUT',
+    body: JSON.stringify({
+      provider_models: modelsDraft.provider_models,
+      provider_order: modelsDraft.provider_order,
+      groups: modelsDraft.groups,
+    })
+  });
+  const errEl = document.getElementById('models-err'), okEl = document.getElementById('models-ok');
+  errEl.textContent = ''; okEl.textContent = '';
+  if (!res.ok) errEl.textContent = data.detail || 'Save failed';
+  else {
+    okEl.textContent = '✅ ' + (data.message || 'Saved');
+    setTimeout(() => okEl.textContent = '', 3000);
+  }
 }
 
 // ---------- tabs ----------

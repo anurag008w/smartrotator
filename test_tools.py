@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 
-os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test_tools.db"
-if os.path.exists("test_tools.db"):
-    os.remove("test_tools.db")
+os.environ["SMARTROTATOR_DATA_DIR"] = "./test_data_tools"
+os.environ["GITHUB_SYNC_ENABLED"] = "false"
+if os.path.exists("./test_data_tools"):
+    shutil.rmtree("./test_data_tools")
 
 from starlette.testclient import TestClient  # noqa: E402
 

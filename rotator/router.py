@@ -81,6 +81,13 @@ class Rotator:
         self.allow_model_routing: bool = True
         self.provider_strategy: str = "sequential"   # sequential | round_robin
 
+        # Model Manager (DB se aata hai — admin dashboard set karta hai)
+        self.managed: dict = {}
+        self.groups: list[dict] = []
+        self._strategy = "round_robin"
+        self._cooldown = 60.0
+        self._ban_after = 3
+
         self.reload()
 
     # ------------------------------------------------------------------
@@ -96,6 +103,9 @@ class Rotator:
         cooldown = float(self.settings.get("cooldown_seconds", 60))
         ban_after = int(self.settings.get("fail_after_attempts", 3))
         self.provider_strategy = self.settings.get("provider_strategy", "sequential")
+        self._strategy = strategy
+        self._cooldown = cooldown
+        self._ban_after = ban_after
 
         server = raw.get("server", {})
         self.default_model = server.get("default_model", "gemini-2.5-flash")
@@ -104,45 +114,9 @@ class Rotator:
         # build provider states
         new_states: list[ProviderState] = []
         for cfg in raw.get("providers", []):
-            name = cfg.get("name", "provider")
-            ptype = cfg.get("type", "openai")
-            models = [m.strip() for m in cfg.get("models", []) if m.strip()]
-            base_url = cfg.get("base_url")
-
-            # env var override: <NAME>_KEYS="key1,key2,key3"
-            env_name = f"{self.env_prefix}{name.upper()}_KEYS"
-            env_keys = os.environ.get(env_name, "")
-            if env_keys.strip():
-                keys = [k.strip() for k in env_keys.split(",") if k.strip()]
-            else:
-                keys = [k.strip() for k in cfg.get("api_keys", []) if k.strip()]
-                # skip placeholder keys
-                keys = [k for k in keys if not k.startswith("PASTE_")]
-
-            if not keys or not models:
-                continue  # provider setup incomplete, skip silently
-
-            pcfg = ProviderConfig(
-                name=name,
-                ptype=ptype,
-                models=models,
-                keys=keys,
-                base_url=base_url,
-                rpm_limit=int(cfg.get("rpm_limit", 0)),
-                rpd_limit=int(cfg.get("rpd_limit", 0)),
-            )
-            ring = KeyRing(
-                keys=pcfg.keys,
-                models=pcfg.models,
-                label=name,
-                strategy=strategy,
-                cooldown_seconds=cooldown,
-                ban_after=ban_after,
-                rpm_limit=pcfg.rpm_limit,
-                rpd_limit=pcfg.rpd_limit,
-            )
-            provider = build_provider(name, ptype, base_url, models)
-            new_states.append(ProviderState(cfg=pcfg, ring=ring, provider=provider))
+            st = self._build_state_from_cfg(cfg)
+            if st is not None:
+                new_states.append(st)
 
         self.providers = new_states
 
@@ -152,6 +126,135 @@ class Rotator:
             self.proxy_pool = self._build_proxy_pool(pcfg)
         else:
             self.proxy_pool = None
+
+    def _build_state_from_cfg(self, cfg: dict) -> Optional[ProviderState]:
+        """Ek provider ka ProviderState banata hai (config.yaml section se)."""
+        name = cfg.get("name", "provider")
+        ptype = cfg.get("type", "openai")
+        models = [m.strip() for m in cfg.get("models", []) if m.strip()]
+        base_url = cfg.get("base_url")
+
+        # env var override: <NAME>_KEYS="key1,key2,key3"
+        env_name = f"{self.env_prefix}{name.upper()}_KEYS"
+        env_keys = os.environ.get(env_name, "")
+        if env_keys.strip():
+            keys = [k.strip() for k in env_keys.split(",") if k.strip()]
+        else:
+            keys = [k.strip() for k in cfg.get("api_keys", []) if k.strip()]
+            # skip placeholder keys
+            keys = [k for k in keys if not k.startswith("PASTE_")]
+
+        if not keys or not models:
+            return None  # provider setup incomplete, skip silently
+
+        return self._build_state(
+            ProviderConfig(
+                name=name,
+                ptype=ptype,
+                models=models,
+                keys=keys,
+                base_url=base_url,
+                rpm_limit=int(cfg.get("rpm_limit", 0)),
+                rpd_limit=int(cfg.get("rpd_limit", 0)),
+            )
+        )
+
+    def _build_state(self, pcfg: ProviderConfig) -> ProviderState:
+        """ProviderConfig se ring + provider + state bana deta hai."""
+        ring = KeyRing(
+            keys=pcfg.keys,
+            models=pcfg.models,
+            label=pcfg.name,
+            strategy=self._strategy,
+            cooldown_seconds=self._cooldown,
+            ban_after=self._ban_after,
+            rpm_limit=pcfg.rpm_limit,
+            rpd_limit=pcfg.rpd_limit,
+        )
+        provider = build_provider(pcfg.name, pcfg.ptype, pcfg.base_url, pcfg.models)
+        return ProviderState(cfg=pcfg, ring=ring, provider=provider)
+
+    def _find_provider(self, name: str) -> Optional[ProviderState]:
+        for st in self.providers:
+            if st.cfg.name == name:
+                return st
+        return None
+
+    def _find_group(self, group_id: str) -> Optional[dict]:
+        for g in self.groups:
+            if g["id"] == group_id:
+                return g
+        return None
+
+    # ------------------------------------------------------------------
+    # Model Manager — dashboard se save ki hui config ko live apply karo
+    # ------------------------------------------------------------------
+    def apply_managed(self, managed: Optional[dict]) -> None:
+        """Active models + groups + provider order ko live laga deta hai.
+
+        DB (Postgres) me stored hai isliye redeploy ke baad bhi survive karta hai.
+        config.yaml ko touch nahi karta — bas runtime state update hota hai.
+        """
+        managed = managed or {}
+        self.managed = managed
+
+        # 1. groups
+        self.groups = []
+        for g in managed.get("groups", []):
+            gid = (g.get("id") or "").strip()
+            members = [
+                {"provider": m.get("provider", ""), "model": m.get("model", "")}
+                for m in g.get("members", [])
+                if m.get("provider") and m.get("model")
+            ]
+            if gid and members:
+                self.groups.append(
+                    {
+                        "id": gid,
+                        "label": g.get("label") or gid,
+                        "enabled": bool(g.get("enabled", True)),
+                        "members": members,
+                    }
+                )
+
+        # 2. provider order
+        order = [p for p in (managed.get("provider_order") or []) if p]
+        if order:
+            index = {p: i for i, p in enumerate(order)}
+            self.providers.sort(key=lambda st: index.get(st.cfg.name, 10**9))
+
+        # 3. active model override (dashboard se select kiye models)
+        overrides = managed.get("provider_models") or {}
+        rebuilt: list[ProviderState] = []
+        for st in self.providers:
+            models = [m for m in (overrides.get(st.cfg.name) or []) if m]
+            if models:
+                pcfg = ProviderConfig(
+                    name=st.cfg.name,
+                    ptype=st.cfg.ptype,
+                    models=models,
+                    keys=st.cfg.keys,
+                    base_url=st.cfg.base_url,
+                    rpm_limit=st.cfg.rpm_limit,
+                    rpd_limit=st.cfg.rpd_limit,
+                )
+                st = self._build_state(pcfg)
+            rebuilt.append(st)
+        self.providers = rebuilt
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def models(self) -> list[dict]:
+        """List all configured models per provider + virtual model groups."""
+        out = []
+        for st in self.providers:
+            for m in st.cfg.models:
+                out.append({"provider": st.cfg.name, "id": m, "type": st.cfg.ptype})
+        for g in self.groups:
+            if g["enabled"]:
+                out.append({"provider": "smartrotator", "id": g["id"], "type": "group"})
+        return out
 
     def _build_proxy_pool(self, pcfg: dict) -> ProxyPool:
         mode = pcfg.get("mode", "file")
@@ -231,9 +334,28 @@ class Rotator:
         candidates: list[tuple[ProviderState, list[str]]] = []
 
         if model:
-            st, resolved = self.resolve_model(model)
-            if st:
-                candidates.append((st, [resolved]))
+            # Virtual model group (jaise "levelup")? -> group ke members me rotate
+            group = self._find_group(model)
+            if group is not None:
+                if not group["enabled"]:
+                    raise ProviderError(
+                        f"Model group '{model}' disabled hai. Dashboard se enable karo.",
+                        retryable=False,
+                    )
+                for member in group["members"]:
+                    st = self._find_provider(member["provider"])
+                    if st and member["model"] in st.cfg.models:
+                        candidates.append((st, [member["model"]]))
+                if not candidates:
+                    raise ProviderError(
+                        f"Model group '{model}' me koi available model nahi hai. "
+                        "Dashboard me models select karo.",
+                        retryable=False,
+                    )
+            else:
+                st, resolved = self.resolve_model(model)
+                if st:
+                    candidates.append((st, [resolved]))
         else:
             for st in self.providers:
                 active = st.cfg.models
