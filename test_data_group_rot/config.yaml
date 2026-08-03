@@ -1,0 +1,10 @@
+providers:
+  - name: gemini
+    type: gemini
+    models: [g1, g2]
+    api_keys: [gk0]
+  - name: openrouter
+    type: openai
+    models: [o1]
+    api_keys: [ok0]
+    base_url: https://openrouter.ai/api/v1

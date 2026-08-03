@@ -292,12 +292,19 @@ class GeminiProvider(Provider):
             text = self._extract_text(data)
             tool_calls = self._extract_tool_calls(data)
             usage = data.get("usageMetadata", {})
-            # Empty reply + reasoning model (gemini-3.x-flash etc.): thinking
-            # ne saara token budget kha liya (thoughtsTokenCount bada, text "").
+            thoughts = usage.get("thoughtsTokenCount", 0) or 0
+            finish_reason = ""
+            try:
+                finish_reason = data["candidates"][0].get("finishReason", "")
+            except (KeyError, IndexError):
+                pass
+            # Reasoning model (gemini-3.x-flash etc.) ne saara token budget
+            # thinking me kha liya → reply empty ya truncated aata hai
+            # (thoughtsTokenCount bada, text "" ya MAX_TOKENS pe ruk gaya).
             # thinkingBudget: 0 se thinking band karke seedha answer milta hai —
             # bas kuch models (3.6-flash) is config ko 400 dete hain, isliye
-            # sirf empty reply pe try karo aur 400 aaye to original reply chhodo.
-            if not text and not tool_calls:
+            # sirf is case me try karo aur 400 aaye to original reply chhodo.
+            if (not text and not tool_calls) or (thoughts > 0 and finish_reason == "MAX_TOKENS"):
                 try:
                     body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
                     resp2 = await http.post(
@@ -309,9 +316,9 @@ class GeminiProvider(Provider):
                     tool_calls = self._extract_tool_calls(data)
                     usage = data.get("usageMetadata", {})
                 except httpx.HTTPStatusError as exc2:
-                    # model thinkingConfig support nahi karta — original empty
-                    # reply hi rakh lo; router empty text ko failure treat
-                    # karke agli key/model try karega
+                    # model thinkingConfig support nahi karta — original reply
+                    # hi rakh lo; router empty text ko failure treat karke agli
+                    # key/model try karega
                     pass
             return ChatResult(
                 text=text,
