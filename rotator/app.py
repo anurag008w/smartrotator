@@ -925,6 +925,7 @@ def _convert_message(m: dict) -> ChatMessage:
     role = m.get("role", "user")
     content = m.get("content")
     images: list[ImageInput] = []
+    files: list[ImageInput] = []
     tool_calls = m.get("tool_calls") or []
     tool_call_id = m.get("tool_call_id") or ""
     name = m.get("name") or ""
@@ -950,6 +951,19 @@ def _convert_message(m: dict) -> ChatMessage:
                         raise ValueError("malformed data URL in image_url")
                 elif url:
                     images.append(ImageInput(url=url))
+            elif ptype in ("file", "input_file"):
+                # PDF / docx / pptx / xlsx ... — OpenAI `file` content part.
+                f = part.get("file") or {}
+                file_data = f.get("file_data") or part.get("file_data") or ""
+                if isinstance(file_data, str) and file_data.startswith("data:"):
+                    try:
+                        meta, b64 = file_data.split(",", 1)
+                        mime = meta.split(";")[0].replace("data:", "") or "application/octet-stream"
+                        files.append(ImageInput(data_base64=b64, mime_type=mime))
+                    except ValueError:
+                        raise ValueError("malformed data URL in file part")
+                elif isinstance(file_data, str) and file_data:
+                    files.append(ImageInput(url=file_data))
         text = "\n".join(t for t in text_parts if t)
     else:
         text = ""
@@ -958,6 +972,7 @@ def _convert_message(m: dict) -> ChatMessage:
         role=role,
         content=text,
         images=images,
+        files=files,
         tool_calls=tool_calls,
         tool_call_id=tool_call_id,
         name=name,

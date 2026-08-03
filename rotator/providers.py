@@ -40,6 +40,8 @@ class ChatMessage:
     role: str = "user"                   # system | user | assistant | tool
     content: str = ""
     images: list[ImageInput] = field(default_factory=list)
+    # Generic file parts (PDF/docx/pptx/xlsx...) — OpenAI `file` content parts.
+    files: list[ImageInput] = field(default_factory=list)
     # Tool calling (OpenAI format):
     tool_calls: list[dict] = field(default_factory=list)  # assistant → model ke calls
     tool_call_id: str = ""               # tool result message me
@@ -221,7 +223,7 @@ class OpenAICompatibleProvider(Provider):
             out["tool_calls"] = msg.tool_calls
             return out
 
-        if not msg.images:
+        if not msg.images and not msg.files:
             return {"role": msg.role, "content": msg.content}
 
         content: list[dict] = [{"type": "text", "text": msg.content}]
@@ -235,6 +237,20 @@ class OpenAICompatibleProvider(Provider):
                 )
             elif img.url:
                 content.append({"type": "image_url", "image_url": {"url": img.url}})
+        for f in msg.files:
+            # OpenAI-compatible gateways jo `file` parts samajhte hain unhe
+            # passthrough karo (image_url nahi — yeh PDF/docx ho sakte hain).
+            if f.data_base64:
+                content.append(
+                    {
+                        "type": "file",
+                        "file": {
+                            "file_data": f"data:{f.mime_type};base64,{f.data_base64}",
+                        },
+                    }
+                )
+            elif f.url:
+                content.append({"type": "file", "file": {"file_url": f.url}})
         return {"role": msg.role, "content": content}
 
 
@@ -407,6 +423,21 @@ class GeminiProvider(Provider):
                     )
                 elif img.url:
                     parts.append({"file_data": {"mime_type": img.mime_type, "file_uri": img.url}})
+            for f in msg.files:
+                # PDF/docx inline raw bytes — Gemini `inline_data` (fileData
+                # requires an already-uploaded Files-API URI, so base64 is the
+                # way for direct requests).
+                if f.data_base64:
+                    parts.append(
+                        {
+                            "inline_data": {
+                                "mime_type": f.mime_type,
+                                "data": f.data_base64,
+                            }
+                        }
+                    )
+                elif f.url:
+                    parts.append({"file_data": {"mime_type": f.mime_type, "file_uri": f.url}})
             if msg.role == "system":
                 if msg.content.strip():
                     system_parts.append(msg.content)
