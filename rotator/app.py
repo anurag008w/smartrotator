@@ -182,7 +182,9 @@ class SetRoleRequest(BaseModel):
 
 class GroupMember(BaseModel):
     provider: str
-    model: str
+    model: str = ""            # backward compat: single model
+    models: list[str] = []     # naya: models queue (member me multiple models)
+    keys: list[int] = []       # selected key indices (empty = saari keys)
 
 
 class ModelGroupInput(BaseModel):
@@ -422,6 +424,10 @@ async def admin_models(request: Request):
                 "name": st.cfg.name,
                 "type": st.cfg.ptype,
                 "key_count": len(st.cfg.keys),
+                "keys": [
+                    {"index": i, "preview": _key_preview(k)}
+                    for i, k in enumerate(st.cfg.keys)
+                ],
                 "configured_models": list(st.cfg.models),
                 "live_models": [m["id"] for m in entry.get("models", [])],
                 "live_error": entry.get("error"),
@@ -455,16 +461,30 @@ async def admin_save_models(req: SaveModelsRequest, request: Request):
     """Dashboard se save — models/groups/order apply karo (config.yaml touch nahi)."""
     await _require_admin(request)
 
-    # groups ko pydantic → plain dicts
-    groups = [
-        {
-            "id": g.id,
-            "label": g.label or g.id,
-            "enabled": g.enabled,
-            "members": [{"provider": m.provider, "model": m.model} for m in g.members],
-        }
-        for g in req.groups
-    ]
+    # groups ko pydantic → plain dicts (member: provider + models queue + keys)
+    groups = []
+    for g in req.groups:
+        members = []
+        for m in g.members:
+            member_models = [x for x in (m.models or ([m.model] if m.model else [])) if x]
+            if not member_models:
+                continue
+            members.append(
+                {
+                    "provider": m.provider,
+                    "models": member_models,
+                    "keys": [i for i in m.keys if isinstance(i, int) and i >= 0],
+                }
+            )
+        if members:
+            groups.append(
+                {
+                    "id": g.id,
+                    "label": g.label or g.id,
+                    "enabled": g.enabled,
+                    "members": members,
+                }
+            )
     await database.save_managed_config(
         provider_models=req.provider_models,
         provider_order=req.provider_order,
@@ -480,6 +500,15 @@ async def admin_save_models(req: SaveModelsRequest, request: Request):
 # Live models cache (provider APIs se fetch — 5 min TTL)
 # --------------------------------------------------------------------------
 LIVE_MODELS_TTL = 300  # seconds (5 min)
+
+
+def _key_preview(key: str) -> str:
+    """API key ka masked preview — aage ka 6 + piche ka 4 char."""
+    if not key:
+        return ""
+    if len(key) <= 10:
+        return "***"
+    return f"{key[:6]}...{key[-4:]}"
 
 
 def _live_cache(request: Request) -> dict:
@@ -1404,13 +1433,38 @@ function renderGroupEditor() {
     card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:10px';
     let membersHtml = '';
     g.members.forEach((m, mi) => {
+      // backward compat: purana single-model member → models array
+      if (!m.models) m.models = m.model ? [m.model] : [];
+      if (!m.keys) m.keys = [];
       const provOpts = modelsData.providers.map(p => `<option value="${p.name}" ${p.name === m.provider ? 'selected' : ''}>${p.name}</option>`).join('');
       const availableModels = providerModelOptions(m.provider);
-      const modelOpts = availableModels.map(mm => `<option value="${mm}" ${mm === m.model ? 'selected' : ''}>${mm}</option>`).join('') || '<option value="">(live models khali — Refresh karo)</option>';
-      membersHtml += `<div style="display:flex;gap:8px;margin-top:8px">
-        <select onchange="updateMember(${gi}, ${mi}, 'provider', this.value)" style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
-        <select onchange="updateMember(${gi}, ${mi}, 'model', this.value)" style="flex:2;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${modelOpts}</select>
-        <button class="btn sec" style="padding:4px 10px" onclick="removeMember(${gi}, ${mi})">✕</button>
+      // models queue chips (order = rotation order)
+      const modelChips = m.models.map((mm, mii) =>
+        `<span class="chip checked">${mm} <span style="cursor:pointer" onclick="removeMemberModel(${gi}, ${mi}, ${mii})" title="hatao">✕</span></span>`).join('');
+      // add-model dropdown — unselected models
+      const unselected = availableModels.filter(mm => !m.models.includes(mm));
+      const addOpts = unselected.map(mm => `<option value="${mm}">${mm}</option>`).join('');
+      const addSel = `<select id="addm-${gi}-${mi}" onchange="addMemberModel(${gi}, ${mi}, this.value); this.value=''" style="flex:2;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)"><option value="">+ model add</option>${addOpts}</select>`;
+      // keys selection — masked preview + checkbox
+      const pInfo = modelsData.providers.find(p => p.name === m.provider);
+      const keyOpts = (pInfo && pInfo.keys || []).map(k => {
+        const on = m.keys.includes(k.index);
+        return `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer" title="${k.index}"><input type="checkbox" ${on ? 'checked' : ''} onchange="toggleMemberKey(${gi}, ${mi}, ${k.index})">${k.preview}</label>`;
+      }).join('');
+      const keyNote = m.keys.length
+        ? `<span class="muted" style="font-size:11px">✅ ${m.keys.length} key select</span>`
+        : '<span class="muted" style="font-size:11px">(kuch nahi select = saari keys)</span>';
+      membersHtml += `<div style="border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:8px;background:var(--panel)">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+          <select onchange="updateMemberProvider(${gi}, ${mi}, this.value)" style="flex:1;min-width:120px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
+          <button class="btn danger" style="padding:4px 10px" onclick="removeMember(${gi}, ${mi})">✕</button>
+        </div>
+        <div class="muted" style="font-size:11px;margin-bottom:4px">Models queue (upar wala pehle try hota hai):</div>
+        <div class="model-list">${modelChips || '<span class="muted" style="font-size:11px">koi model nahi — neeche se add karo</span>'}</div>
+        <div style="display:flex;gap:8px;margin-top:6px">${addSel}<button class="btn sec" style="padding:8px 12px" onclick="addMemberModel(${gi}, ${mi}, document.getElementById('addm-${gi}-${mi}').value); document.getElementById('addm-${gi}-${mi}').value=''">+</button></div>
+        <div class="muted" style="font-size:11px;margin:8px 0 4px">API keys (${pInfo ? pInfo.key_count : 0} available):</div>
+        <div class="model-list">${keyOpts || '<span class="muted" style="font-size:11px">koi keys nahi</span>'}</div>
+        ${keyNote}
       </div>`;
     });
     card.innerHTML = `
@@ -1422,7 +1476,7 @@ function renderGroupEditor() {
       </div>
       <div style="margin-top:8px">${membersHtml}</div>
       <button class="btn sec" style="padding:6px 12px;margin-top:10px" onclick="addMember(${gi})">+ Member</button>
-      <div class="muted" style="margin-top:6px;font-size:12px">App bhejega: model = "<b>${g.id || 'levelup'}</b>" → server members me rotate karega</div>`;
+      <div class="muted" style="margin-top:6px;font-size:12px">App bhejega: model = "<b>${g.id || 'levelup'}</b>" → server pehle member 1 ke saare models+keys, phir member 2, ... rotate karega</div>`;
     box.appendChild(card);
   });
 }
@@ -1437,17 +1491,35 @@ function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); re
 function addMember(gi) {
   const prov = modelsData.providers[0] || { name: '' };
   const opts = providerModelOptions(prov.name);
-  modelsDraft.groups[gi].members.push({ provider: prov.name, model: opts[0] || '' });
+  modelsDraft.groups[gi].members.push({ provider: prov.name, models: opts.length ? [opts[0]] : [], keys: [] });
   renderGroupEditor();
 }
-function updateMember(gi, mi, key, val) {
-  modelsDraft.groups[gi].members[mi][key] = val;
-  if (key === 'provider') {
-    // provider badla → model reset karo (live models me se pehla)
-    const opts = providerModelOptions(val);
-    modelsDraft.groups[gi].members[mi].model = opts[0] || '';
-    renderGroupEditor();
-  }
+function addMemberModel(gi, mi, model) {
+  const m = (model || '').trim();
+  if (!m) return;
+  const mem = modelsDraft.groups[gi].members[mi];
+  if (!mem.models) mem.models = [];
+  if (!mem.models.includes(m)) mem.models.push(m);
+  renderGroupEditor();
+}
+function removeMemberModel(gi, mi, mii) {
+  modelsDraft.groups[gi].members[mi].models.splice(mii, 1);
+  renderGroupEditor();
+}
+function toggleMemberKey(gi, mi, ki) {
+  const mem = modelsDraft.groups[gi].members[mi];
+  if (!mem.keys) mem.keys = [];
+  const i = mem.keys.indexOf(ki);
+  if (i >= 0) mem.keys.splice(i, 1); else mem.keys.push(ki);
+  mem.keys.sort((a, b) => a - b);
+  renderGroupEditor();
+}
+function updateMemberProvider(gi, mi, val) {
+  const mem = modelsDraft.groups[gi].members[mi];
+  mem.provider = val;
+  mem.models = [];   // provider badla → models queue reset
+  mem.keys = [];     // keys bhi reset (doosre provider ki keys hain)
+  renderGroupEditor();
 }
 
 async function saveModels() {
@@ -1457,9 +1529,11 @@ async function saveModels() {
   modelsDraft.groups.forEach(g => {
     if (!g.enabled) return;
     g.members.forEach(m => {
-      if (!m.provider || !m.model) return;
+      if (!m.provider || !m.models || !m.models.length) return;
       if (!provider_models[m.provider]) provider_models[m.provider] = [];
-      if (!provider_models[m.provider].includes(m.model)) provider_models[m.provider].push(m.model);
+      m.models.forEach(mm => {
+        if (!provider_models[m.provider].includes(mm)) provider_models[m.provider].push(mm);
+      });
       if (!provider_order.includes(m.provider)) provider_order.push(m.provider);
     });
   });

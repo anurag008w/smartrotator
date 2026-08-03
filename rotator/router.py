@@ -84,6 +84,7 @@ class Rotator:
         # Model Manager (DB se aata hai — admin dashboard set karta hai)
         self.managed: dict = {}
         self.groups: list[dict] = []
+        self._member_rings: dict[str, list[Optional[KeyRing]]] = {}
         self._strategy = "round_robin"
         self._cooldown = 60.0
         self._ban_after = 3
@@ -252,15 +253,38 @@ class Rotator:
         managed = managed or {}
         self.managed = managed
 
-        # 1. groups
+        # 1. groups — har member: provider + models queue + keys subset
         self.groups = []
+        self._member_rings = {}
         for g in managed.get("groups", []):
             gid = (g.get("id") or "").strip()
-            members = [
-                {"provider": m.get("provider", ""), "model": m.get("model", "")}
-                for m in g.get("members", [])
-                if m.get("provider") and m.get("model")
-            ]
+            members = []
+            member_rings: list[Optional[KeyRing]] = []
+            for m in g.get("members", []):
+                provider_name = (m.get("provider") or "").strip()
+                # backward compat: `model` string ho toh [model] banao
+                models = [x for x in (m.get("models") or ([m["model"]] if m.get("model") else [])) if x]
+                key_indices = [i for i in (m.get("keys") or []) if isinstance(i, int) and i >= 0]
+                st = self._find_provider(provider_name)
+                if not provider_name or not models or st is None:
+                    continue
+                # keys subset — provider ki keys me se select ki hui
+                if key_indices:
+                    keys = [st.cfg.keys[i] for i in key_indices if i < len(st.cfg.keys)]
+                else:
+                    keys = list(st.cfg.keys)
+                if not keys:
+                    continue
+                ring = KeyRing(
+                    keys=keys,
+                    models=models,
+                    label=f"{gid}.{provider_name}",
+                    strategy=self._strategy,
+                    cooldown_seconds=self._cooldown,
+                    ban_after=self._ban_after,
+                )
+                members.append({"provider": provider_name, "models": models, "keys": key_indices})
+                member_rings.append(ring)
             if gid and members:
                 self.groups.append(
                     {
@@ -270,6 +294,7 @@ class Rotator:
                         "members": members,
                     }
                 )
+                self._member_rings[gid] = member_rings
 
         # 2. provider order
         order = [p for p in (managed.get("provider_order") or []) if p]
@@ -373,8 +398,9 @@ class Rotator:
         attempts = max_fallback_attempts or int(self.settings.get("max_fallback_attempts", 16))
         last_error: Optional[Exception] = None
 
-        # candidates: list of (ProviderState, active_models)
-        candidates: list[tuple[ProviderState, list[str]]] = []
+        # candidates: list of (ProviderState, KeyRing, active_models)
+        # group members ke liye alag ring hota hai (selected keys + models queue)
+        candidates: list[tuple[ProviderState, KeyRing, list[str]]] = []
 
         if model:
             # Virtual model group (jaise "levelup")? -> group ke members me rotate
@@ -385,10 +411,13 @@ class Rotator:
                         f"Model group '{model}' disabled hai. Dashboard se enable karo.",
                         retryable=False,
                     )
-                for member in group["members"]:
+                member_rings = self._member_rings.get(group["id"], [])
+                for idx, member in enumerate(group["members"]):
                     st = self._find_provider(member["provider"])
-                    if st and member["model"] in st.cfg.models:
-                        candidates.append((st, [member["model"]]))
+                    ring = member_rings[idx] if idx < len(member_rings) else None
+                    member_models = member.get("models") or []
+                    if st and ring and member_models:
+                        candidates.append((st, ring, member_models))
                 if not candidates:
                     raise ProviderError(
                         f"Model group '{model}' me koi available model nahi hai. "
@@ -398,14 +427,14 @@ class Rotator:
             else:
                 st, resolved = self.resolve_model(model)
                 if st:
-                    candidates.append((st, [resolved]))
+                    candidates.append((st, st.ring, [resolved]))
         else:
             for st in self.providers:
                 active = st.cfg.models
                 if models is not None:
                     active = [m for m in active if m in models]
                 if active:
-                    candidates.append((st, active))
+                    candidates.append((st, st.ring, active))
 
         if not candidates:
             raise ProviderError(
@@ -418,9 +447,9 @@ class Rotator:
             provider_pick = self._pick_available_provider(candidates)
             if provider_pick is None:
                 break
-            st, active_models = provider_pick
+            st, ring, active_models = provider_pick
 
-            picked = st.ring.pick(active_models)
+            picked = ring.pick(active_models)
             if picked is None:
                 continue
             state, resolved_model = picked
@@ -437,8 +466,8 @@ class Rotator:
                     tools=tools,
                     tool_choice=tool_choice,
                 )
-                st.ring.report_success(state, resolved_model)
-                st.ring.record_used(state)
+                ring.report_success(state, resolved_model)
+                ring.record_used(state)
                 st.successes += 1
                 st.last_error = None
                 result.key_label = state.label
@@ -447,12 +476,12 @@ class Rotator:
                     self.proxy_pool.report_success(proxy)
                 return result
             except RateLimitError as exc:
-                st.ring.report_failure(state, resolved_model)
+                ring.report_failure(state, resolved_model)
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_failure(proxy)
                 last_error = exc
             except ProviderError as exc:
-                st.ring.report_failure(state, resolved_model)
+                ring.report_failure(state, resolved_model)
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_failure(proxy)
                 st.failures += 1
@@ -469,8 +498,8 @@ class Rotator:
     # Internal helpers
     # ------------------------------------------------------------------
     def _pick_available_provider(
-        self, candidates: list[tuple[ProviderState, list[str]]]
-    ) -> Optional[tuple[ProviderState, list[str]]]:
+        self, candidates: list[tuple[ProviderState, KeyRing, list[str]]]
+    ) -> Optional[tuple[ProviderState, KeyRing, list[str]]]:
         """
         sequential: current provider pe tab tak ruko jab tak usme koi
         (key, model) available hai — usse poori tarah drain karo, phir
@@ -482,20 +511,20 @@ class Rotator:
 
         if self.provider_strategy == "round_robin":
             for offset in range(len(candidates)):
-                st, active = candidates[self._provider_cursor % len(candidates)]
+                st, ring, active = candidates[self._provider_cursor % len(candidates)]
                 self._provider_cursor += 1
-                if st.ring.has_available(active):
-                    return st, active
+                if ring.has_available(active):
+                    return st, ring, active
             return None
 
         # sequential drain
         for offset in range(len(candidates)):
-            st, active = candidates[(self._provider_cursor + offset) % len(candidates)]
-            if st.ring.has_available(active):
+            st, ring, active = candidates[(self._provider_cursor + offset) % len(candidates)]
+            if ring.has_available(active):
                 if offset > 0:
                     # current provider drain ho chuka — agle available pe move
                     self._provider_cursor = (self._provider_cursor + offset) % len(candidates)
-                return st, active
+                return st, ring, active
         return None
 
     def _pick_proxy(self) -> Optional[str]:
@@ -512,6 +541,14 @@ class Rotator:
             "strategy": self.settings.get("strategy", "round_robin"),
             "provider_strategy": self.provider_strategy,
             "proxy": self.proxy_pool.status() if self.proxy_pool else {"enabled": False},
+            "groups": [
+                {
+                    "id": g["id"],
+                    "enabled": g["enabled"],
+                    "members": g["members"],
+                }
+                for g in self.groups
+            ],
             "providers": [
                 {
                     "name": st.cfg.name,
