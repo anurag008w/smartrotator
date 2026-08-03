@@ -170,6 +170,12 @@ async def test_group_rotation_fallback():
     assert result.text == "hi from openrouter"
     print("TEST 4 — member1 exhausted → member2       ✅ PASS ->", result.model)
 
+    # Dashboard `models: ["levelup"]` (array) se group call — pehle yeh
+    # ProviderError deta tha ("no matching model"), ab group resolve hona chahiye
+    result2 = await rot.chat([ChatMessage(role="user", content="hi")], models=["levelup"], max_fallback_attempts=5)
+    assert result2.text == "hi from openrouter", f"models-array group call fail: {result2.text}"
+    print("TEST 4b — models=['levelup'] array group call ✅ PASS ->", result2.model)
+
 
 def main() -> int:
     results = []

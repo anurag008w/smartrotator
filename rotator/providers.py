@@ -292,6 +292,27 @@ class GeminiProvider(Provider):
             text = self._extract_text(data)
             tool_calls = self._extract_tool_calls(data)
             usage = data.get("usageMetadata", {})
+            # Empty reply + reasoning model (gemini-3.x-flash etc.): thinking
+            # ne saara token budget kha liya (thoughtsTokenCount bada, text "").
+            # thinkingBudget: 0 se thinking band karke seedha answer milta hai —
+            # bas kuch models (3.6-flash) is config ko 400 dete hain, isliye
+            # sirf empty reply pe try karo aur 400 aaye to original reply chhodo.
+            if not text and not tool_calls:
+                try:
+                    body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+                    resp2 = await http.post(
+                        url, headers=headers, params=params, json=body
+                    )
+                    resp2.raise_for_status()
+                    data = resp2.json()
+                    text = self._extract_text(data)
+                    tool_calls = self._extract_tool_calls(data)
+                    usage = data.get("usageMetadata", {})
+                except httpx.HTTPStatusError as exc2:
+                    # model thinkingConfig support nahi karta — original empty
+                    # reply hi rakh lo; router empty text ko failure treat
+                    # karke agli key/model try karega
+                    pass
             return ChatResult(
                 text=text,
                 provider=self.name,

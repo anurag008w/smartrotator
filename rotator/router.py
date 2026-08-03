@@ -429,10 +429,30 @@ class Rotator:
                 if st:
                     candidates.append((st, st.ring, [resolved]))
         else:
+            # Dashboard `models: ["levelup"]` (array) bhejta hai — group ids ko
+            # bhi detect karo, warna group me "no matching model" ProviderError
+            # aata hai (sirf `model` field wale group pe hi chal raha tha).
+            requested_models = models or []
+            group_ids = [m for m in requested_models if self._find_group(m)]
+            non_group_models = [m for m in requested_models if m not in group_ids]
+            for gid in group_ids:
+                group = self._find_group(gid)
+                if not group["enabled"]:
+                    raise ProviderError(
+                        f"Model group '{gid}' disabled hai. Dashboard se enable karo.",
+                        retryable=False,
+                    )
+                member_rings = self._member_rings.get(group["id"], [])
+                for idx, member in enumerate(group["members"]):
+                    st = self._find_provider(member["provider"])
+                    ring = member_rings[idx] if idx < len(member_rings) else None
+                    member_models = member.get("models") or []
+                    if st and ring and member_models:
+                        candidates.append((st, ring, member_models))
             for st in self.providers:
                 active = st.cfg.models
-                if models is not None:
-                    active = [m for m in active if m in models]
+                if non_group_models:
+                    active = [m for m in active if m in non_group_models]
                 if active:
                     candidates.append((st, st.ring, active))
 
@@ -474,6 +494,16 @@ class Rotator:
                 result.model = resolved_model
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_success(proxy)
+                # Empty reply (reasoning model ne saara budget thinking me
+                # kha liya) → failure treat karke agli key/model try karo.
+                if not result.text and not result.tool_calls:
+                    ring.report_failure(state, resolved_model)
+                    last_error = ProviderError(
+                        f"{st.provider_name}/{resolved_model}: empty reply "
+                        "(saara token budget thinking me chala gaya — max_tokens "
+                        "badha kar try karo)"
+                    )
+                    continue
                 return result
             except RateLimitError as exc:
                 ring.report_failure(state, resolved_model)
