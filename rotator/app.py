@@ -55,6 +55,7 @@ from .providers import (
     ImageInput,
     ProviderError,
     RateLimitError,
+    fetch_live_models,
 )
 from .router import Rotator
 
@@ -79,12 +80,19 @@ async def lifespan(app: FastAPI):
     # 1) GitHub sync: restart pe PEHLE pull (data restore, DB ki zaroorat nahi)
     await asyncio.to_thread(github_sync.pull_data)
 
-    # 2) JSON store load karo (users + usage + managed config)
+    # 2) JSON store load karo (users + usage + managed config + custom providers)
     await database.init_db()
+
+    # 2b) Custom providers (dashboard se add kiye) apply karo
+    custom = await database.list_custom_providers()
+    rotator.apply_custom_providers(custom)
 
     # 3) Model Manager: dashboard ka saved config (models/groups/order) apply karo
     managed = await database.load_managed_config()
     rotator.apply_managed(managed)
+
+    # live models cache (provider APIs se fetch, 5 min TTL)
+    app.state.live_models_cache: dict[str, dict] = {}  # name -> {fetched_at, models, error}
 
     # 4) background sync task — har 3 min me data change ho toh push
     stop_event = asyncio.Event()
@@ -181,6 +189,15 @@ class SaveModelsRequest(BaseModel):
     groups: list[ModelGroupInput] = []
 
 
+class CustomProviderInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    type: str = "openai"          # gemini | openai
+    base_url: str = ""
+    api_keys: list[str] = []
+    models: list[str] = []
+    enabled: bool = True
+
+
 # --------------------------------------------------------------------------
 # Public endpoints
 # --------------------------------------------------------------------------
@@ -192,13 +209,20 @@ async def health():
 @app.get("/v1/models")
 async def list_models(request: Request):
     rotator: Rotator = request.app.state.rotator
-    return {
-        "object": "list",
-        "data": [
-            {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
-            for m in rotator.models()
-        ],
-    }
+    # live models (cache me jo fresh hai) bhi merge karo — mobile app jaisa
+    live = _live_models_for_list(request)
+    data = [
+        {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
+        for m in rotator.models()
+    ]
+    # live models jo configured list me nahi — unhe bhi dikhao (tag: live)
+    seen = {m["id"] for m in data}
+    for m in live:
+        if m["id"] not in seen:
+            data.append(
+                {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": "live"}
+            )
+    return {"object": "list", "data": data}
 
 
 @app.get("/status")
@@ -404,6 +428,235 @@ async def admin_save_models(req: SaveModelsRequest, request: Request):
     rotator: Rotator = request.app.state.rotator
     rotator.apply_managed(await database.load_managed_config())
     return {"ok": True, "message": "Models config save + apply ho gayi"}
+
+
+# --------------------------------------------------------------------------
+# Live models cache (provider APIs se fetch — 5 min TTL)
+# --------------------------------------------------------------------------
+LIVE_MODELS_TTL = 300  # seconds (5 min)
+
+
+def _live_cache(request: Request) -> dict:
+    cache = getattr(request.app.state, "live_models_cache", None)
+    if cache is None:
+        cache = {}
+        request.app.state.live_models_cache = cache
+    return cache
+
+
+async def _refresh_live_models(request: Request, name: str, force: bool = False) -> dict:
+    """Ek provider ke liye live models fetch karo + cache me daalo.
+
+    Provider config rotator (ya store) se milta hai — pehle custom provider
+    (dashboard se add), phir config.yaml wala. Returns cache entry.
+    """
+    cache = _live_cache(request)
+    now = time.time()
+    entry = cache.get(name)
+    if entry and not force and (now - entry.get("fetched_at", 0)) < LIVE_MODELS_TTL:
+        return entry
+
+    rotator: Rotator = request.app.state.rotator
+    # provider info dhoondo: custom store → rotator state → raw config
+    ptype, base_url, api_keys, models = None, None, [], []
+    for st in rotator.providers:
+        if st.cfg.name == name:
+            ptype, base_url, api_keys = st.cfg.ptype, st.cfg.base_url, list(st.cfg.keys)
+            models = list(st.cfg.models)
+            break
+    if ptype is None:
+        for p in _load_config().get("providers", []):
+            if p.get("name") == name:
+                ptype = p.get("type", "openai")
+                base_url = p.get("base_url")
+                api_keys = [k.strip() for k in p.get("api_keys", []) if not k.startswith("PASTE_")]
+                models = [m for m in p.get("models", []) if not str(m).startswith("PASTE_")]
+                break
+    if ptype is None:
+        # custom store me ho sakta hai (rotator me models empty ho toh skip hua)
+        cp = await database.get_custom_provider(name)
+        if cp:
+            ptype = cp.get("type", "openai")
+            base_url = cp.get("base_url")
+            api_keys = cp.get("api_keys", [])
+            models = cp.get("models", [])
+
+    if ptype is None or not api_keys:
+        entry = {"fetched_at": now, "models": [], "error": "provider not configured / no keys"}
+        cache[name] = entry
+        return entry
+
+    try:
+        live = await fetch_live_models(name, ptype, base_url, api_keys)
+        entry = {
+            "fetched_at": now,
+            "models": [
+                {
+                    "id": m.id,
+                    "name": m.name,
+                    "provider": m.provider,
+                    "context_length": m.context_length,
+                    "supports_streaming": m.supports_streaming,
+                    "supports_vision": m.supports_vision,
+                    "supports_reasoning": m.supports_reasoning,
+                    "supports_tool_calling": m.supports_tool_calling,
+                    "is_free": m.is_free,
+                }
+                for m in live
+            ],
+            "error": None,
+            "configured_models": models,
+        }
+    except Exception as exc:  # noqa: BLE001 — cache me error hi rakh do
+        entry = {
+            "fetched_at": now,
+            "models": [],
+            "error": str(exc)[:500],
+            "configured_models": models,
+        }
+    cache[name] = entry
+    return entry
+
+
+def _live_models_for_list(request: Request) -> list[dict]:
+    """/v1/models ke liye cached live models (TTL check)."""
+    cache = _live_cache(request)
+    now = time.time()
+    out = []
+    for name, entry in cache.items():
+        if (now - entry.get("fetched_at", 0)) > LIVE_MODELS_TTL:
+            continue
+        for m in entry.get("models", []):
+            out.append({"id": m["id"], "provider": m.get("provider") or name})
+    return out
+
+
+# --------------------------------------------------------------------------
+# Custom providers admin endpoints (dashboard se add/remove)
+# --------------------------------------------------------------------------
+@app.get("/admin/providers")
+async def admin_providers(request: Request):
+    """Custom providers list + live models cache status."""
+    await _require_admin(request)
+    custom = await database.list_custom_providers()
+    # public view: keys ko mask karo (dashboard pe sirf count dikhega)
+    public = []
+    for p in custom:
+        public.append(
+            {
+                "name": p.get("name"),
+                "type": p.get("type", "openai"),
+                "base_url": p.get("base_url", ""),
+                "key_count": len(p.get("api_keys", [])),
+                "models": p.get("models", []),
+                "enabled": p.get("enabled", True),
+            }
+        )
+    cache = _live_cache(request)
+    status = []
+    for name, entry in cache.items():
+        status.append(
+            {
+                "name": name,
+                "fetched_at": entry.get("fetched_at"),
+                "count": len(entry.get("models", [])),
+                "error": entry.get("error"),
+            }
+        )
+    return {"providers": public, "cache": status}
+
+
+@app.post("/admin/providers")
+async def admin_add_provider(req: CustomProviderInput, request: Request):
+    """Naya provider add karo (ya same name pe update) + live apply."""
+    await _require_admin(request)
+
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Provider name required")
+    ptype = req.type.strip().lower()
+    if ptype not in ("gemini", "openai"):
+        raise HTTPException(status_code=400, detail="type must be 'gemini' or 'openai'")
+    if ptype == "openai" and not req.base_url.strip():
+        raise HTTPException(status_code=400, detail="openai provider needs base_url")
+
+    keys = [k.strip() for k in req.api_keys if k.strip()]
+    if not keys:
+        raise HTTPException(status_code=400, detail="At least one API key required")
+    models = [m.strip() for m in req.models if m.strip()]
+
+    provider = {
+        "name": name,
+        "type": ptype,
+        "base_url": req.base_url.strip(),
+        "api_keys": keys,
+        "models": models,
+        "enabled": req.enabled,
+    }
+    await database.upsert_custom_provider(provider)
+
+    # live apply karo
+    rotator: Rotator = request.app.state.rotator
+    custom = await database.list_custom_providers()
+    rotator.apply_custom_providers(custom)
+
+    # naye provider ke liye live models fetch karo (background me nahi — turant)
+    try:
+        entry = await _refresh_live_models(request, name, force=True)
+    except Exception:  # noqa: BLE001
+        entry = None
+
+    return {
+        "ok": True,
+        "message": f"Provider '{name}' add/update ho gaya",
+        "live": (entry or {}).get("models", []),
+        "live_error": (entry or {}).get("error"),
+    }
+
+
+@app.delete("/admin/providers/{name}")
+async def admin_delete_provider(name: str, request: Request):
+    """Provider hatao + live apply."""
+    await _require_admin(request)
+    removed = await database.remove_custom_provider(name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Provider '{name}' not found")
+    rotator: Rotator = request.app.state.rotator
+    custom = await database.list_custom_providers()
+    rotator.apply_custom_providers(custom)
+    _live_cache(request).pop(name, None)
+    return {"ok": True, "message": f"Provider '{name}' delete ho gaya"}
+
+
+@app.post("/admin/providers/{name}/fetch-models")
+async def admin_fetch_models(name: str, request: Request):
+    """Provider API se LIVE models fetch karo (force refresh + cache update)."""
+    await _require_admin(request)
+    entry = await _refresh_live_models(request, name, force=True)
+    if entry.get("error"):
+        raise HTTPException(status_code=502, detail=f"Live fetch failed: {entry['error']}")
+    return {
+        "ok": True,
+        "provider": name,
+        "models": entry.get("models", []),
+        "configured_models": entry.get("configured_models", []),
+    }
+
+
+@app.post("/admin/providers/refresh-all")
+async def admin_refresh_all_models(request: Request):
+    """Saare configured providers ke live models refresh karo (force)."""
+    await _require_admin(request)
+    rotator: Rotator = request.app.state.rotator
+    names = [st.cfg.name for st in rotator.providers]
+    results = []
+    for name in names:
+        try:
+            entry = await _refresh_live_models(request, name, force=True)
+            results.append({"name": name, "count": len(entry.get("models", [])), "error": entry.get("error")})
+        except Exception as exc:  # noqa: BLE001
+            results.append({"name": name, "count": 0, "error": str(exc)})
+    return {"ok": True, "results": results}
 
 
 # --------------------------------------------------------------------------
@@ -810,6 +1063,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div style="height:18px"></div>
         <button class="btn" onclick="saveModels()">💾 Save Models Config</button>
       </div>
+
+      <div class="card">
+        <h3 style="margin-bottom:4px">Custom Providers <span class="tag" style="color:var(--accent2)">LIVE models</span></h3>
+        <div class="muted" style="margin-bottom:12px">Apna provider add karo (Gemini ya OpenAI-compatible — mobile app jaisa). API keys daalo, "Fetch Live Models" se real models lao. 🚀</div>
+        <div class="err" id="prov-err"></div>
+        <div class="ok" id="prov-ok"></div>
+        <div id="custom-providers-list"></div>
+        <button class="btn sec" onclick="toggleProviderForm()" style="margin-top:10px" id="prov-add-btn">+ Add Provider</button>
+        <button class="btn sec" onclick="refreshAllLive()" style="margin-top:10px" id="prov-refresh-btn">🔄 Refresh All Live Models</button>
+        <div id="provider-form" style="display:none;margin-top:14px;background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+            <input id="pf-name" placeholder="name (jaise my-gemini)" style="flex:1;min-width:140px;padding:8px">
+            <select id="pf-type" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">
+              <option value="openai">OpenAI-compatible</option>
+              <option value="gemini">Gemini</option>
+            </select>
+          </div>
+          <input id="pf-base" placeholder="base URL (openai type ke liye zaroori, jaise https://api.openai.com/v1)" style="width:100%;padding:8px;margin-bottom:10px">
+          <textarea id="pf-keys" placeholder="API keys — ek line me ek (comma bhi chalega)" rows="2" style="width:100%;padding:8px;margin-bottom:10px"></textarea>
+          <input id="pf-models" placeholder="models (optional, comma separated) — khali chhodo toh fetch live se ayenge" style="width:100%;padding:8px;margin-bottom:10px">
+          <button class="btn" onclick="saveProvider()">💾 Save Provider</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -1036,6 +1312,137 @@ async function loadModelsAdmin() {
   if (!modelsDraft.groups) modelsDraft.groups = [];
   renderOrderEditor();
   renderGroupEditor();
+  loadCustomProviders();
+}
+
+// ---------- custom providers (live models) ----------
+let customProviders = [];
+
+async function loadCustomProviders() {
+  const { res, data } = await api('/admin/providers');
+  if (!res.ok) return;
+  customProviders = data.providers || [];
+  renderCustomProviders();
+}
+
+function renderCustomProviders() {
+  const box = document.getElementById('custom-providers-list');
+  box.innerHTML = '';
+  if (customProviders.length === 0) {
+    box.innerHTML = '<div class="muted">Abhi koi custom provider nahi. "+ Add Provider" se jodo — jaise mobile app me. 😊</div>';
+    return;
+  }
+  customProviders.forEach(p => {
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:12px;margin-bottom:10px';
+    const modelsHtml = (p.models || []).map(m => `<span class="chip checked">${m}</span>`).join('') || '<span class="muted">koi models save nahi — Fetch Live karo</span>';
+    card.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <strong>${p.name}</strong>
+          <span class="tag">${p.type}</span>
+          <span class="tag" style="color:var(--accent2)">🔑 ${p.key_count} key${p.key_count === 1 ? '' : 's'}</span>
+          ${p.enabled ? '' : '<span class="tag" style="color:var(--red)">disabled</span>'}
+          ${p.base_url ? `<span class="muted" style="font-size:11px">${p.base_url}</span>` : ''}
+        </div>
+        <div style="display:flex;gap:6px">
+          <button class="btn sec" style="padding:6px 10px" onclick="fetchLive('${p.name}')">⚡ Fetch Live Models</button>
+          <button class="btn danger" style="padding:6px 10px" onclick="deleteProvider('${p.name}')">🗑</button>
+        </div>
+      </div>
+      <div class="model-list">${modelsHtml}</div>
+      <div id="live-${p.name}" class="muted" style="margin-top:8px;font-size:12px"></div>`;
+    box.appendChild(card);
+  });
+}
+
+function toggleProviderForm() {
+  const f = document.getElementById('provider-form');
+  f.style.display = f.style.display === 'none' ? '' : 'none';
+  const b = document.getElementById('prov-add-btn');
+  b.textContent = f.style.display === 'none' ? '+ Add Provider' : '✕ Cancel';
+}
+
+function setProvMsg(text, ok) {
+  document.getElementById(ok ? 'prov-ok' : 'prov-err').textContent = text;
+  setTimeout(() => document.getElementById(ok ? 'prov-ok' : 'prov-err').textContent = '', 4000);
+}
+
+async function saveProvider() {
+  const name = document.getElementById('pf-name').value.trim();
+  if (!name) return setProvMsg('Provider name chahiye', false);
+  const keys = document.getElementById('pf-keys').value.split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+  if (keys.length === 0) return setProvMsg('Kam se kam ek API key chahiye', false);
+  const models = document.getElementById('pf-models').value.split(',').map(s => s.trim()).filter(Boolean);
+  const body = {
+    name,
+    type: document.getElementById('pf-type').value,
+    base_url: document.getElementById('pf-base').value.trim(),
+    api_keys: keys,
+    models,
+    enabled: true,
+  };
+  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) return setProvMsg(data.detail || 'Add failed', false);
+  setProvMsg('✅ ' + (data.message || 'Saved') + (data.live && data.live.length ? ` — ${data.live.length} live models mile!` : ''), true);
+  document.getElementById('pf-name').value = '';
+  document.getElementById('pf-keys').value = '';
+  document.getElementById('pf-models').value = '';
+  toggleProviderForm();
+  loadCustomProviders();
+  loadModelsAdminData();
+}
+
+async function deleteProvider(name) {
+  if (!confirm('Provider "' + name + '" delete karna? Chat me use ho raha hoga toh woh models bhi hatenge.')) return;
+  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name), { method: 'DELETE' });
+  if (!res.ok) return setProvMsg(data.detail || 'Delete failed', false);
+  setProvMsg('✅ ' + (data.message || 'Deleted'), true);
+  loadCustomProviders();
+}
+
+async function fetchLive(name) {
+  const el = document.getElementById('live-' + name);
+  el.textContent = '⏳ live models fetch ho rahe hain…';
+  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name) + '/fetch-models', { method: 'POST' });
+  if (!res.ok) {
+    el.textContent = '❌ ' + (data.detail || 'Failed');
+    return;
+  }
+  const models = data.models || [];
+  el.innerHTML = '⚡ <b>' + models.length + '</b> live models: ' +
+    models.map(m => `<span class="chip checked" style="cursor:pointer" title="${m.name || m.id}" onclick="addLiveModel('${name}', '${(m.id || '').replace(/'/g, "\\'")}')">${m.id}</span>`).join('');
+  setProvMsg('✅ Live models aa gaye! Model pe click karo = custom model add. Ya Refresh All se sab refresh.', true);
+}
+
+async function refreshAllLive() {
+  const btn = document.getElementById('prov-refresh-btn');
+  btn.disabled = true; btn.textContent = '⏳ refreshing…';
+  const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
+  btn.disabled = false; btn.textContent = '🔄 Refresh All Live Models';
+  if (!res.ok) { setProvMsg(data.detail || 'Failed', false); return; }
+  const lines = (data.results || []).map(r => `${r.name}: ${r.count} models${r.error ? ' (❌ ' + r.error + ')' : ''}`).join('<br>');
+  setProvMsg('✅ Sab refresh: <br>' + lines, true);
+}
+
+function addLiveModel(provider, model) {
+  // live model ko us provider ke selected models me daal do (modelsDraft)
+  if (!modelsDraft.provider_models[provider]) modelsDraft.provider_models[provider] = [];
+  if (!modelsDraft.provider_models[provider].includes(model)) modelsDraft.provider_models[provider].push(model);
+  setProvMsg('✅ "' + model + '" ' + provider + ' ke models me add ho gaya — "Save Models Config" dabao!', true);
+  renderOrderEditor();
+}
+
+async function loadModelsAdminData() {
+  const { res, data } = await api('/admin/models');
+  if (!res.ok) return;
+  modelsData = data;
+  modelsDraft = JSON.parse(JSON.stringify(data.managed));
+  if (!modelsDraft.provider_models) modelsDraft.provider_models = {};
+  if (!modelsDraft.provider_order) modelsDraft.provider_order = [];
+  if (!modelsDraft.groups) modelsDraft.groups = [];
+  renderOrderEditor();
+  renderGroupEditor();
 }
 
 function renderOrderEditor() {
@@ -1114,7 +1521,8 @@ function renderGroupEditor() {
     let membersHtml = '';
     g.members.forEach((m, mi) => {
       const provOpts = modelsData.providers.map(p => `<option value="${p.name}" ${p.name === m.provider ? 'selected' : ''}>${p.name}</option>`).join('');
-      const availableModels = (modelsData.catalog && modelsData.catalog[m.provider]) || [];
+      const pInfo = modelsData.providers.find(p => p.name === m.provider);
+      const availableModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[m.provider]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
       const modelOpts = availableModels.map(mm => `<option value="${mm}" ${mm === m.model ? 'selected' : ''}>${mm}</option>`).join('');
       membersHtml += `<div style="display:flex;gap:8px;margin-top:8px">
         <select onchange="updateMember(${gi}, ${mi}, 'provider', this.value)" style="flex:1;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
@@ -1145,7 +1553,8 @@ function addGroup() {
 function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); renderGroupEditor(); }
 function addMember(gi) {
   const prov = modelsData.providers[0] || { name: '' };
-  const catalogModels = (modelsData.catalog && modelsData.catalog[prov.name]) || [];
+  const pInfo = modelsData.providers.find(p => p.name === prov.name);
+  const catalogModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[prov.name]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
   modelsDraft.groups[gi].members.push({ provider: prov.name, model: catalogModels[0] || '' });
   renderGroupEditor();
 }
@@ -1153,7 +1562,8 @@ function updateMember(gi, mi, key, val) {
   modelsDraft.groups[gi].members[mi][key] = val;
   if (key === 'provider') {
     // provider badla → model reset karo
-    const catalogModels = (modelsData.catalog && modelsData.catalog[val]) || [];
+    const pInfo = modelsData.providers.find(p => p.name === val);
+    const catalogModels = Array.from(new Set(((modelsData.catalog && modelsData.catalog[val]) || []).concat(pInfo ? pInfo.configured_models || [] : [])));
     modelsDraft.groups[gi].members[mi].model = catalogModels[0] || '';
     renderGroupEditor();
   }

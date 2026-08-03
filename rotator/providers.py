@@ -16,6 +16,7 @@ import base64
 import json
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -434,3 +435,201 @@ def build_provider(name: str, ptype: str, base_url: str | None, models: list[str
             raise ValueError(f"provider '{name}': openai type needs base_url")
         return OpenAICompatibleProvider(name, base_url, models)
     raise ValueError(f"provider '{name}': unknown type '{ptype}'")
+
+
+# --------------------------------------------------------------------------
+# Live models fetch (mobile app jaisa — provider APIs se real models)
+# --------------------------------------------------------------------------
+@dataclass
+class LiveModel:
+    """Provider API se fetch kiya hua model (mobile app ke ModelInfo jaisa)."""
+
+    id: str
+    name: str = ""
+    provider: str = ""
+    context_length: Optional[int] = None
+    supports_streaming: Optional[bool] = None
+    supports_vision: Optional[bool] = None
+    supports_reasoning: Optional[bool] = None
+    supports_tool_calling: Optional[bool] = None
+    is_free: bool = False
+    fetched_at: float = 0.0
+
+
+def _map_gemini_model(raw: dict, provider: str, fetched_at: float) -> Optional[LiveModel]:
+    name = raw.get("name", "")
+    if not isinstance(name, str):
+        return None
+    mid = name.replace("models/", "")
+    if not mid:
+        return None
+    display = raw.get("displayName") or mid
+    desc = str(raw.get("description") or "").lower()
+    methods = raw.get("supportedGenerationMethods") or []
+    return LiveModel(
+        id=mid,
+        name=display,
+        provider=provider,
+        context_length=raw.get("inputTokenLimit"),
+        supports_streaming="streamGenerateContent" in methods,
+        supports_vision=True if ("vision" in desc or "image" in desc or "multimodal" in desc) else None,
+        supports_reasoning=True if ("reasoning" in desc) else None,
+        supports_tool_calling=True if ("function calling" in desc or "tools" in desc) else None,
+        fetched_at=fetched_at,
+    )
+
+
+def _map_openai_model(raw: dict, provider: str, fetched_at: float) -> Optional[LiveModel]:
+    mid = raw.get("id")
+    if not isinstance(mid, str) or not mid:
+        return None
+    params = raw.get("supported_parameters") or []
+    input_mods = raw.get("input_modalities") or ["text"]
+    pricing = raw.get("pricing") or {}
+    prompt = pricing.get("prompt") if isinstance(pricing, dict) else None
+    completion = pricing.get("completion") if isinstance(pricing, dict) else None
+    is_free = prompt in (0, 0.0, "0") and completion in (0, 0.0, "0")
+    return LiveModel(
+        id=mid,
+        name=raw.get("name") or mid,
+        provider=provider,
+        context_length=raw.get("context_length") or raw.get("context_window"),
+        supports_streaming="streaming" in params if params else None,
+        supports_vision=True if "image" in input_mods else ("vision" in params if params else None),
+        supports_reasoning="reasoning" in params if params else None,
+        supports_tool_calling="tools" in params if params else None,
+        is_free=is_free,
+        fetched_at=fetched_at,
+    )
+
+
+async def fetch_live_models(
+    name: str,
+    ptype: str,
+    base_url: Optional[str],
+    api_keys: list[str],
+    timeout: float = 20.0,
+    max_pages: int = 5,
+) -> list[LiveModel]:
+    """Provider API se live models fetch karo (har key try, first success wins).
+
+    - gemini : GET {base}/v1beta/models?pageSize=200 (+ pageToken)
+    - openai : GET {base}/models                (+ after / last_id)
+
+    Mobile app (levelup) ke fetchModels() jaisa hi pattern.
+    """
+    if ptype == "gemini":
+        return await _fetch_live_gemini(name, base_url, api_keys, timeout, max_pages)
+    if ptype == "openai":
+        return await _fetch_live_openai(name, base_url, api_keys, timeout, max_pages)
+    raise ValueError(f"provider '{name}': unknown type '{ptype}'")
+
+
+async def _fetch_live_gemini(
+    name: str,
+    base_url: Optional[str],
+    api_keys: list[str],
+    timeout: float,
+    max_pages: int,
+) -> list[LiveModel]:
+    if not api_keys:
+        raise AuthError(f"{name}: no api keys provided", retryable=False)
+    if base_url:
+        base = base_url.rstrip("/")
+        # base_url ya to root hai (isliye /v1beta/models) ya already /v1beta
+        if base.endswith("/v1beta") or base.endswith("/v1"):
+            models_url = f"{base}/models"
+        else:
+            models_url = f"{base}/v1beta/models"
+    else:
+        models_url = f"{GEMINI_V1}/models"
+
+    last_err: Optional[Exception] = None
+    for key in api_keys:
+        try:
+            models: list[LiveModel] = []
+            page_token: Optional[str] = None
+            fetched_at = __import__("time").time()
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+                for _ in range(max_pages):
+                    url = f"{models_url}?pageSize=200"
+                    if page_token:
+                        url += f"&pageToken={quote(page_token)}"
+                    resp = await client.get(url, params={"key": key})
+                    resp.raise_for_status()
+                    data = resp.json()
+                    for raw in data.get("models", []):
+                        m = _map_gemini_model(raw, name, fetched_at)
+                        if m:
+                            models.append(m)
+                    page_token = data.get("nextPageToken")
+                    if not page_token:
+                        break
+            return models
+        except httpx.HTTPStatusError as exc:
+            last_err = exc
+            if exc.response.status_code in (401, 403):
+                continue  # is key se nai — next key try
+            raise self_map_error_live(exc, name) from exc
+        except httpx.HTTPError as exc:
+            last_err = exc
+            continue
+    raise ProviderError(f"{name}: live models fetch failed: {last_err}") from last_err
+
+
+async def _fetch_live_openai(
+    name: str,
+    base_url: Optional[str],
+    api_keys: list[str],
+    timeout: float,
+    max_pages: int,
+) -> list[LiveModel]:
+    if not api_keys:
+        raise AuthError(f"{name}: no api keys provided", retryable=False)
+    if not base_url:
+        raise ValueError(f"provider '{name}': openai type needs base_url")
+    base = base_url.rstrip("/")
+    models_url = f"{base}/models"
+
+    last_err: Optional[Exception] = None
+    for key in api_keys:
+        try:
+            models: list[LiveModel] = []
+            after: Optional[str] = None
+            fetched_at = __import__("time").time()
+            headers = {"Authorization": f"Bearer {key}"}
+            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+                for _ in range(max_pages):
+                    url = models_url
+                    if after:
+                        url += f"?after={quote(after)}"
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    items = data.get("data", []) if isinstance(data, dict) else []
+                    for raw in items:
+                        m = _map_openai_model(raw, name, fetched_at)
+                        if m:
+                            models.append(m)
+                    # pagination: OpenAI /models pe last_id hota hai
+                    last_id = data.get("last_id") if isinstance(data, dict) else None
+                    if not last_id and items:
+                        last_id = items[-1].get("id")
+                    if not last_id or len(items) < 20:
+                        break
+                    after = last_id
+            return models
+        except httpx.HTTPStatusError as exc:
+            last_err = exc
+            if exc.response.status_code in (401, 403):
+                continue
+            raise self_map_error_live(exc, name) from exc
+        except httpx.HTTPError as exc:
+            last_err = exc
+            continue
+    raise ProviderError(f"{name}: live models fetch failed: {last_err}") from last_err
+
+
+def self_map_error_live(exc: httpx.HTTPStatusError, context: str) -> ProviderError:
+    """Live-fetch errors ke liye chhota error mapper (reuse provider._map_error)."""
+    return Provider._map_error(exc, context)

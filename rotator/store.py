@@ -8,6 +8,7 @@ directory ke JSON files me rehte hain. Ye directory GitHub sync
   data/users.json     — users (password hash, api keys, role, limit)
   data/usage.json     — per-user per-day {requests, tokens}
   data/managed.json   — Model Manager config (models/groups/order)
+  data/providers.json — custom providers (admin dashboard se add/remove)
 
 Har mutation ke baad atomic write hota hai (tmp file + rename), taaki
 aadha-likha file kabhi na bane.
@@ -28,6 +29,7 @@ DATA_DIR = github_sync.DATA_DIR
 USERS_FILE = DATA_DIR / "users.json"
 USAGE_FILE = DATA_DIR / "usage.json"
 MANAGED_FILE = DATA_DIR / "managed.json"
+PROVIDERS_FILE = DATA_DIR / "providers.json"
 
 _lock = asyncio.Lock()
 
@@ -36,6 +38,7 @@ _users: dict[int, dict] = {}          # id -> user dict
 _next_id: int = 1
 _usage: dict[int, dict[str, dict]] = {}   # user_id -> {day: {"requests":n, "tokens":n}}
 _managed: dict = {"provider_models": {}, "provider_order": [], "groups": []}
+_custom_providers: list[dict] = []    # admin dashboard se add kiye providers
 
 
 # --------------------------------------------------------------------------
@@ -123,6 +126,9 @@ async def init_db() -> None:
         m = _read_json(MANAGED_FILE, None)
         if m:
             _managed.update(m)
+
+        _custom_providers.clear()
+        _custom_providers.extend(_read_json(PROVIDERS_FILE, []))
 
 
 def _user_from_dict(u: dict) -> User:
@@ -313,3 +319,54 @@ async def save_managed_config(
         _managed["provider_order"] = provider_order or []
         _managed["groups"] = groups or []
         _write_json(MANAGED_FILE, _managed)
+
+
+# --------------------------------------------------------------------------
+# Custom providers — admin dashboard se add/remove (live models feature)
+# --------------------------------------------------------------------------
+async def list_custom_providers() -> list[dict]:
+    """Dashboard-added providers (name/type/base_url/keys/models/enabled)."""
+    async with _lock:
+        return [dict(p) for p in _custom_providers]
+
+
+async def get_custom_provider(name: str) -> Optional[dict]:
+    async with _lock:
+        for p in _custom_providers:
+            if p.get("name") == name:
+                return dict(p)
+        return None
+
+
+async def save_custom_providers(providers: list[dict]) -> None:
+    """Poori custom providers list replace karo (atomic write)."""
+    async with _lock:
+        _custom_providers.clear()
+        _custom_providers.extend(providers)
+        _write_json(PROVIDERS_FILE, _custom_providers)
+
+
+async def upsert_custom_provider(provider: dict) -> None:
+    """Ek provider add/update karo (naam se match)."""
+    async with _lock:
+        name = provider.get("name", "")
+        replaced = False
+        for i, p in enumerate(_custom_providers):
+            if p.get("name") == name:
+                _custom_providers[i] = provider
+                replaced = True
+                break
+        if not replaced:
+            _custom_providers.append(provider)
+        _write_json(PROVIDERS_FILE, _custom_providers)
+
+
+async def remove_custom_provider(name: str) -> bool:
+    """Provider hatao. Returns True agar mila tha."""
+    async with _lock:
+        before = len(_custom_providers)
+        _custom_providers[:] = [p for p in _custom_providers if p.get("name") != name]
+        if len(_custom_providers) != before:
+            _write_json(PROVIDERS_FILE, _custom_providers)
+            return True
+        return False

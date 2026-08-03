@@ -119,6 +119,68 @@ def main() -> int:
         ok = r.status_code == 200 and r.json()["api_key"] != old_key
         results.append(("rotate key", ok, r.status_code))
 
+        # ---------- TEST 12: custom providers admin (mobile-app jaisa) ----------
+        # non-admin access denied
+        r = client.post(
+            "/admin/providers",
+            headers={"Authorization": f"Bearer {bob['token']}"},
+            json={"name": "my-gemini", "type": "gemini", "api_keys": ["fake-key"]},
+        )
+        results.append(("custom provider non-admin 403", r.status_code == 403, r.status_code))
+
+        # invalid type rejected
+        r = client.post(
+            "/admin/providers",
+            headers=hdr,
+            json={"name": "bad", "type": "nonsense", "api_keys": ["x"]},
+        )
+        results.append(("custom provider bad type 400", r.status_code == 400, r.status_code))
+
+        # openai type bina base_url rejected
+        r = client.post(
+            "/admin/providers",
+            headers=hdr,
+            json={"name": "bad2", "type": "openai", "api_keys": ["x"]},
+        )
+        results.append(("openai provider no base_url 400", r.status_code == 400, r.status_code))
+
+        # valid gemini provider add — live fetch fail ho jayega (fake key) par add ho jayega
+        r = client.post(
+            "/admin/providers",
+            headers=hdr,
+            json={"name": "my-gemini", "type": "gemini", "api_keys": ["fake-key-000"], "models": ["gemini-2.5-flash"]},
+        )
+        ok = r.status_code == 200 and r.json()["ok"]
+        results.append(("custom provider add", ok, r.status_code))
+
+        # list me dikhna chahiye
+        r = client.get("/admin/providers", headers=hdr)
+        names = [p["name"] for p in r.json().get("providers", [])]
+        results.append(("custom provider list", "my-gemini" in names, names))
+
+        # duplicate add = update (same name)
+        r = client.post(
+            "/admin/providers",
+            headers=hdr,
+            json={"name": "my-gemini", "type": "gemini", "api_keys": ["fake-key-000", "fake-key-111"], "models": ["gemini-2.5-flash", "gemini-2.5-pro"]},
+        )
+        r2 = client.get("/admin/providers", headers=hdr)
+        my = next((p for p in r2.json()["providers"] if p["name"] == "my-gemini"), None)
+        results.append(("custom provider update (2 keys)", my is not None and my["key_count"] == 2, my))
+
+        # rotator me bhi live hai — /v1/models me dikhna chahiye
+        r3 = client.get("/v1/models")
+        ids = [m["id"] for m in r3.json()["data"]]
+        results.append(("custom provider in /v1/models", "gemini-2.5-flash" in ids, ids[:5]))
+
+        # delete
+        r = client.delete("/admin/providers/my-gemini", headers=hdr)
+        ok = r.status_code == 200 and r.json()["ok"]
+        results.append(("custom provider delete", ok, r.status_code))
+        r = client.get("/admin/providers", headers=hdr)
+        names = [p["name"] for p in r.json().get("providers", [])]
+        results.append(("custom provider gone after delete", "my-gemini" not in names, names))
+
     # ---------- print ----------
     passed = 0
     print(f"\n{'TEST':<40} {'RESULT':<12} CODE")

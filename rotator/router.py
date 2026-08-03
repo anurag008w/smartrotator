@@ -120,6 +120,10 @@ class Rotator:
 
         self.providers = new_states
 
+        # custom providers (dashboard se add kiye) dobara apply karo
+        if getattr(self, "_custom_provider_cfgs", None):
+            self._merge_custom_states()
+
         # proxy pool (optional)
         pcfg = raw.get("proxy", {})
         if pcfg.get("enabled", False):
@@ -158,6 +162,56 @@ class Rotator:
                 rpd_limit=int(cfg.get("rpd_limit", 0)),
             )
         )
+
+    # ------------------------------------------------------------------
+    # Custom providers — admin dashboard se add/remove kiye providers
+    # ------------------------------------------------------------------
+    def apply_custom_providers(self, custom_cfgs: list[dict]) -> None:
+        """Dashboard-added providers ko live laga deta hai.
+
+        `custom_cfgs` = store (data/providers.json) se aaye providers:
+          [{"name", "type", "base_url", "api_keys", "models", "enabled"}, ...]
+
+        Inhe existing providers ke saath merge karta hai — same name pe
+        custom wala win karta hai (config.yaml override nahi hota).
+        """
+        self._custom_provider_cfgs = list(custom_cfgs)
+        self._merge_custom_states()
+        # managed config (order/models) phir se apply karo
+        if self.managed:
+            self.apply_managed(self.managed)
+
+    def _merge_custom_states(self) -> None:
+        """Custom provider configs se ProviderState banake merge karo."""
+        custom_cfgs = getattr(self, "_custom_provider_cfgs", []) or []
+        custom_states: list[ProviderState] = []
+        for cfg in custom_cfgs:
+            if not cfg.get("enabled", True):
+                continue
+            name = (cfg.get("name") or "").strip()
+            ptype = cfg.get("type", "openai")
+            models = [m.strip() for m in cfg.get("models", []) if m.strip()]
+            keys = [k.strip() for k in cfg.get("api_keys", []) if k.strip() if not k.startswith("PASTE_")]
+            if not name or not keys or not models:
+                continue
+            custom_states.append(
+                self._build_state(
+                    ProviderConfig(
+                        name=name,
+                        ptype=ptype,
+                        models=models,
+                        keys=keys,
+                        base_url=cfg.get("base_url"),
+                        rpm_limit=int(cfg.get("rpm_limit", 0)),
+                        rpd_limit=int(cfg.get("rpd_limit", 0)),
+                    )
+                )
+            )
+
+        # same name ke custom provider se config.yaml wala override
+        custom_names = {st.cfg.name for st in custom_states}
+        base_states = [st for st in self.providers if st.cfg.name not in custom_names]
+        self.providers = base_states + custom_states
 
     def _build_state(self, pcfg: ProviderConfig) -> ProviderState:
         """ProviderConfig se ring + provider + state bana deta hai."""
