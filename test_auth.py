@@ -119,6 +119,38 @@ def main() -> int:
         ok = r.status_code == 200 and r.json()["api_key"] != old_key
         results.append(("rotate key", ok, r.status_code))
 
+        # ---------- TEST 11b: change password ----------
+        r = client.post(
+            "/auth/change-password",
+            headers={"Authorization": f"Bearer {bob['token']}"},
+            json={"old_password": "bobpass123", "new_password": "newbobpass9"},
+        )
+        ok = r.status_code == 200 and r.json()["ok"]
+        results.append(("change password", ok, r.status_code))
+        # naye password se login
+        r = client.post("/auth/login", json={"username": "bob", "password": "newbobpass9"})
+        results.append(("login with new password", r.status_code == 200, r.status_code))
+        # galat old password rejected
+        r = client.post(
+            "/auth/change-password",
+            headers={"Authorization": f"Bearer {bob['token']}"},
+            json={"old_password": "wrong", "new_password": "whatever123"},
+        )
+        results.append(("change password bad old 401", r.status_code == 401, r.status_code))
+        # admin role change
+        r = client.post(
+            f"/admin/users/{bob_id}/role",
+            headers=hdr,
+            json={"role": "admin"},
+        )
+        results.append(("admin promote bob", r.status_code == 200 and r.json()["role"] == "admin", r.status_code))
+        r = client.post(
+            f"/admin/users/{bob_id}/role",
+            headers=hdr,
+            json={"role": "user"},
+        )
+        results.append(("admin demote bob", r.status_code == 200 and r.json()["role"] == "user", r.status_code))
+
         # ---------- TEST 12: custom providers admin (mobile-app jaisa) ----------
         # non-admin access denied
         r = client.post(

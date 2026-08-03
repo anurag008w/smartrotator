@@ -226,6 +226,31 @@ async def rotate_api_key(user_id: int, new_key: str) -> Optional[User]:
         return _user_from_dict(u)
 
 
+async def set_password(user_id: int, password_hash: str, salt: str) -> Optional[User]:
+    """User ka password update karo (change-password feature)."""
+    async with _lock:
+        u = _users.get(int(user_id))
+        if not u:
+            return None
+        u["password_hash"] = password_hash
+        u["salt"] = salt
+        _persist_users_locked()
+        return _user_from_dict(u)
+
+
+async def set_role(user_id: int, role: str) -> Optional[User]:
+    """User ka role update karo (admin promote/demote)."""
+    async with _lock:
+        u = _users.get(int(user_id))
+        if not u:
+            return None
+        if role not in ("admin", "user"):
+            raise ValueError("role must be 'admin' or 'user'")
+        u["role"] = role
+        _persist_users_locked()
+        return _user_from_dict(u)
+
+
 def _persist_users_locked() -> None:
     _write_json(
         USERS_FILE,

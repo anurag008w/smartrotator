@@ -171,6 +171,15 @@ class SetLimitRequest(BaseModel):
     daily_limit: int = Field(..., ge=1, le=100000)
 
 
+class ChangePasswordRequest(BaseModel):
+    old_password: str = ""
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+
+class SetRoleRequest(BaseModel):
+    role: str = Field(..., pattern="^(admin|user)$")
+
+
 class GroupMember(BaseModel):
     provider: str
     model: str
@@ -309,6 +318,28 @@ async def rotate_key(request: Request):
     return {"api_key": db_user.api_key}
 
 
+@app.post("/auth/change-password")
+async def change_password(req: ChangePasswordRequest, request: Request):
+    """Apna password badlo — old password verify karke (ya admin pehli baar set)."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+
+    db_user = await database.get_user_by_id(user.id)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # old password check — optional agar old_password khali hai (first-time set)
+    if req.old_password:
+        if not verify_password(req.old_password, db_user.password_hash, db_user.salt):
+            raise HTTPException(status_code=401, detail="Old password galat hai")
+
+    password_hash, salt = hash_password(req.new_password)
+    updated = await database.set_password(user.id, password_hash, salt)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True, "message": "Password update ho gaya"}
+
+
 # --------------------------------------------------------------------------
 # Admin endpoints
 # --------------------------------------------------------------------------
@@ -349,6 +380,17 @@ async def admin_set_limit(user_id: int, req: SetLimitRequest, request: Request):
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     return {"ok": True, "username": target.username, "daily_limit": target.daily_limit}
+
+
+@app.post("/admin/users/{user_id}/role")
+async def admin_set_role(user_id: int, req: SetRoleRequest, request: Request):
+    """Kisi user ko admin promote/demote karo."""
+    await _require_admin(request)
+
+    target = await database.set_role(user_id, req.role)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"ok": True, "username": target.username, "role": target.role}
 
 
 # --------------------------------------------------------------------------
@@ -1033,6 +1075,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="err" id="settings-err"></div>
         <div class="ok" id="settings-ok"></div>
         <hr style="border:none;border-top:1px solid var(--border);margin:20px 0">
+        <h3 style="margin-bottom:10px">🔑 Change Password</h3>
+        <p class="muted" style="margin-bottom:10px">Apna password badlo — old password daalo + naya password. (Pehli baar set kar rahe ho toh old khali chhodo.)</p>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input id="pw-old" type="password" placeholder="old password (optional)" style="flex:1;min-width:120px;padding:8px" autocomplete="current-password">
+          <input id="pw-new" type="password" placeholder="new password (min 6)" style="flex:1;min-width:120px;padding:8px" autocomplete="new-password">
+          <button class="btn sec" onclick="changePassword()">💾 Update</button>
+        </div>
+        <div style="height:10px"></div>
+        <hr style="border:none;border-top:1px solid var(--border);margin:20px 0">
         <button class="btn danger" onclick="logout()">Logout</button>
       </div>
     </div>
@@ -1253,6 +1304,14 @@ async function rotateKey() {
   if (res.ok) { document.getElementById('api-key').value = data.api_key; setSettingsMsg('✅ New key generated!', true); }
   else setSettingsMsg('❌ ' + (data.detail || 'Failed'), false);
 }
+async function changePassword() {
+  const oldpw = document.getElementById('pw-old').value;
+  const newpw = document.getElementById('pw-new').value;
+  if (newpw.length < 6) return setSettingsMsg('❌ Naya password kam se kam 6 chars ka ho', false);
+  const { res, data } = await api('/auth/change-password', { method: 'POST', body: JSON.stringify({ old_password: oldpw, new_password: newpw }) });
+  if (res.ok) { document.getElementById('pw-old').value = ''; document.getElementById('pw-new').value = ''; setSettingsMsg('✅ ' + (data.message || 'Password update!'), true); }
+  else setSettingsMsg('❌ ' + (data.detail || 'Failed'), false);
+}
 function setSettingsMsg(text, ok) {
   const el = document.getElementById(ok ? 'settings-ok' : 'settings-err');
   el.textContent = text; setTimeout(() => el.textContent = '', 3000);
@@ -1285,13 +1344,21 @@ async function loadAdmin() {
   data.users.forEach(u => {
     const tr = document.createElement('tr');
     tr.innerHTML = `<td>${u.id}</td><td>${u.username}</td>
-      <td class="${u.role === 'admin' ? 'badge-admin' : ''}">${u.role}</td>
+      <td><select class="role-sel" data-id="${u.id}" onchange="setRole(${u.id}, this.value)" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px 6px;color:var(--text)">
+        <option value="user" ${u.role === 'user' ? 'selected' : ''}>user</option>
+        <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>admin</option>
+      </select></td>
       <td class="muted">${u.api_key}</td>
       <td>${u.today_requests}</td>
       <td>${u.daily_limit}</td>
       <td><input type="number" value="${u.daily_limit}" min="1" style="width:80px;padding:6px" onchange="setLimit(${u.id}, this.value)"></td>`;
     tb.appendChild(tr);
   });
+}
+async function setRole(id, role) {
+  const { res, data } = await api('/admin/users/' + id + '/role', { method: 'POST', body: JSON.stringify({ role }) });
+  if (!res.ok) { alert(data.detail || 'Failed'); loadAdmin(); }
+  else setSettingsMsg('✅ ' + data.username + ' → ' + data.role, true);
 }
 async function setLimit(id, value) {
   const { res, data } = await api('/admin/users/' + id + '/limit', { method: 'POST', body: JSON.stringify({ daily_limit: parseInt(value) }) });
