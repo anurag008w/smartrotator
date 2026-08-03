@@ -276,17 +276,6 @@ class Rotator:
             quarantine_failures=int(pcfg.get("quarantine_failures", 3)),
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def models(self) -> list[dict]:
-        """List all configured models per provider."""
-        out = []
-        for st in self.providers:
-            for m in st.cfg.models:
-                out.append({"provider": st.cfg.name, "id": m, "type": st.cfg.ptype})
-        return out
-
     def resolve_model(self, requested: Optional[str]) -> tuple[Optional[ProviderState], str]:
         """
         Find a provider that can serve `requested` model.
