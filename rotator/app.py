@@ -1557,6 +1557,10 @@ function renderGroupEditor() {
       const keyNote = m.keys.length
         ? `<span class="muted" style="font-size:11px">✅ ${m.keys.length} key select</span>`
         : '<span class="muted" style="font-size:11px">(kuch nahi select = saari keys)</span>';
+      const keyAllBtn = (pInfo && pInfo.keys && pInfo.keys.length)
+        ? `<button class="btn sec" style="padding:2px 8px;font-size:11px" onclick="selectAllKeys(${gi}, ${mi})">Select All</button>
+           <button class="btn sec" style="padding:2px 8px;font-size:11px" onclick="clearKeys(${gi}, ${mi})">Clear</button>`
+        : '';
       membersHtml += `<div style="border:1px solid var(--border);border-radius:10px;padding:10px;margin-top:8px;background:var(--panel)">
         <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
           <select onchange="updateMemberProvider(${gi}, ${mi}, this.value)" style="flex:1;min-width:120px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:8px;color:var(--text)">${provOpts}</select>
@@ -1565,7 +1569,10 @@ function renderGroupEditor() {
         <div class="muted" style="font-size:11px;margin-bottom:4px">Models queue (upar wala pehle try hota hai):</div>
         <div class="model-list">${modelChips || '<span class="muted" style="font-size:11px">koi model nahi — neeche se add karo</span>'}</div>
         <div style="display:flex;gap:8px;margin-top:6px">${addSel}<button class="btn sec" style="padding:8px 12px" onclick="addMemberModel(${gi}, ${mi}, document.getElementById('addm-${gi}-${mi}').value); document.getElementById('addm-${gi}-${mi}').value=''">+</button></div>
-        <div class="muted" style="font-size:11px;margin:8px 0 4px">API keys (${pInfo ? pInfo.key_count : 0} available):</div>
+        <div style="display:flex;align-items:center;gap:8px;margin:8px 0 4px">
+          <div class="muted" style="font-size:11px">API keys (${pInfo ? pInfo.key_count : 0} available):</div>
+          ${keyAllBtn}
+        </div>
         <div class="model-list">${keyOpts || '<span class="muted" style="font-size:11px">koi keys nahi</span>'}</div>
         ${keyNote}
       </div>`;
@@ -1594,7 +1601,21 @@ function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); re
 function addMember(gi) {
   const prov = modelsData.providers[0] || { name: '' };
   const opts = providerModelOptions(prov.name);
-  modelsDraft.groups[gi].members.push({ provider: prov.name, models: opts.length ? [opts[0]] : [], keys: [] });
+  const pInfo = modelsData.providers.find(p => p.name === prov.name);
+  // default: saare models + saari keys select — taaki rotation me fallback mile
+  const keyIdx = (pInfo && pInfo.keys || []).map(k => k.index);
+  modelsDraft.groups[gi].members.push({ provider: prov.name, models: opts.slice(), keys: keyIdx });
+  renderGroupEditor();
+}
+function selectAllKeys(gi, mi) {
+  const mem = modelsDraft.groups[gi].members[mi];
+  const pInfo = modelsData.providers.find(p => p.name === mem.provider);
+  mem.keys = (pInfo && pInfo.keys || []).map(k => k.index);
+  renderGroupEditor();
+}
+function clearKeys(gi, mi) {
+  const mem = modelsDraft.groups[gi].members[mi];
+  mem.keys = [];
   renderGroupEditor();
 }
 function addMemberModel(gi, mi, model) {
