@@ -879,7 +879,9 @@ async def _require_user(request: Request, settings: dict):
 
 
 async def _reserve_quota(user) -> bool:
-    """Request reserve karo — quota bacha hai toh True."""
+    """Request reserve karo — quota bacha hai toh True. Admin ke liye unlimited."""
+    if user.is_admin:
+        return True
     return await database.reserve_quota(user.id, database.today_utc(), user.daily_limit)
 
 

@@ -76,27 +76,47 @@ def main() -> int:
         )
         results.append(("gateway no auth 401", r.status_code == 401, r.status_code))
 
-        # ---------- TEST 8: quota exhaustion → 429 ----------
-        # manually bump usage to limit
+        # ---------- TEST 8: quota exhaustion → 429 (normal user) ----------
+        # alice admin hai (unlimited), isliye ek normal user banake test karo
         import asyncio
 
         from rotator import store as database
 
+        r = client.post("/auth/register", json={"username": "carol", "password": "carolpass123"})
+        carol = r.json()
+        results.append(("register carol (user role)", carol["user"]["role"] == "user", carol["user"]["role"]))
+
+        # manually bump usage to limit
         async def bump():
-            await database.set_usage(alice["user"]["id"], database.today_utc(), alice["user"]["daily_limit"])
+            await database.set_usage(carol["user"]["id"], database.today_utc(), carol["user"]["daily_limit"])
 
         asyncio.run(bump())
         r = client.post(
             "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {alice['api_key']}"},
+            headers={"Authorization": f"Bearer {carol['api_key']}"},
             json={"model": "gemini-2.5-flash", "messages": [{"role": "user", "content": "hi"}]},
         )
         ok = r.status_code == 429 and "quota" in r.json()["detail"].lower()
         results.append(("quota exhausted 429", ok, r.status_code))
 
+        # ---------- TEST 8b: admin ke liye quota unlimited ----------
+        # (test env me providers placeholder hain isliye direct function test)
+        from rotator.app import _reserve_quota  # noqa: E402
+
+        async def check_admin_quota():
+            # alice (admin) ka usage bhi limit pe bitha do
+            await database.set_usage(alice["user"]["id"], database.today_utc(), alice["user"]["daily_limit"])
+            alice_user = await database.get_user_by_id(alice["user"]["id"])
+            # usage limit pe hai phir bhi admin ko True milna chahiye
+            return await _reserve_quota(alice_user)
+
+        ok = asyncio.run(check_admin_quota()) is True
+        results.append(("admin unlimited quota", ok, ok))
+
+
         # ---------- TEST 9: admin users list ----------
         r = client.get("/admin/users", headers=hdr)
-        ok = r.status_code == 200 and len(r.json()["users"]) == 1
+        ok = r.status_code == 200 and len(r.json()["users"]) == 2
         results.append(("admin users list", ok, r.status_code))
 
         # ---------- TEST 10: register normal user + admin set limit ----------
