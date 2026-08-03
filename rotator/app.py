@@ -233,7 +233,18 @@ async def list_models(request: Request):
             data.append(
                 {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": "live"}
             )
-    return {"object": "list", "data": data}
+    return {"object": "list", "data": data, "default_model": rotator.default_model}
+
+
+@app.get("/v1/models/raw")
+async def list_models_raw(request: Request):
+    """Raw (bina live merge) models — dashboard picker ke liye lighter."""
+    rotator: Rotator = request.app.state.rotator
+    data = [
+        {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
+        for m in rotator.models()
+    ]
+    return {"object": "list", "data": data, "default_model": rotator.default_model}
 
 
 @app.get("/status")
@@ -1004,6 +1015,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-ok { color:var(--green); } .badge-admin { color:var(--yellow); }
   .err { color:var(--red); font-size:13px; margin-top:8px; }
   .ok { color:var(--green); font-size:13px; margin-top:8px; }
+  .modal { position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.65); display:flex; align-items:center; justify-content:center; padding:16px; }
+  .modal-box { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:18px; width:min(620px,100%); max-height:86vh; display:flex; flex-direction:column; }
+  .pick-item { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; cursor:pointer; border:1px solid var(--border); margin-bottom:6px; background:var(--panel2); font-size:13px; }
+  .pick-item.on { border-color:var(--accent); }
+  .pick-item input { accent-color:var(--accent); width:15px; height:15px; }
+  .pick-item .id { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   @media (max-width:760px){ .grid2{ grid-template-columns:1fr; } }
 </style>
 </head>
@@ -1053,7 +1070,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- CHAT -->
     <div class="view active" id="view-chat">
       <div class="card">
-        <div class="muted" style="margin-bottom:10px">Models (multi-select — inhi me rotation hogi):</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+          <div class="muted">Models (multi-select — inhi me rotation hogi):</div>
+          <button class="btn sec" onclick="openModelPicker()">🎯 Pick Models <span id="pickCount" class="tag" style="color:var(--accent2)">0</span></button>
+        </div>
         <div class="model-list" id="modelList"><span class="muted">Loading…</span></div>
         <div id="messages" style="margin-top:16px;"></div>
         <div style="margin-top:8px;display:flex;gap:8px">
@@ -1064,6 +1084,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="row" style="margin-top:10px">
           <textarea id="prompt" rows="2" placeholder="Message… (Enter=send, Shift+Enter=newline)"></textarea>
           <button class="btn" id="sendBtn" onclick="send()">Send ➤</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODEL PICKER MODAL -->
+    <div class="modal" id="modelPicker" style="display:none">
+      <div class="modal-box">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <h3 style="margin:0">🎯 Pick Models</h3>
+          <button class="btn sec" onclick="closeModelPicker()">✕</button>
+        </div>
+        <input id="pickSearch" class="field" style="width:100%;box-sizing:border-box;margin-bottom:10px" placeholder="🔍 Search models… (jaise gemini-3.5)" oninput="renderPickerList()">
+        <div id="pickProviders" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px"></div>
+        <div id="pickList" style="max-height:46vh;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:8px"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;gap:8px;flex-wrap:wrap">
+          <div class="muted" id="pickStatus"></div>
+          <div style="display:flex;gap:8px">
+            <button class="btn sec" onclick="pickAll()">All</button>
+            <button class="btn sec" onclick="pickNone()">Clear</button>
+            <button class="btn" onclick="applyPicks()">✅ Apply</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1155,7 +1196,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 let token = localStorage.getItem('sr_token') || '';
 let images = [];
-let models = [];
 
 // ---------- helpers ----------
 async function api(path, opts = {}) {
@@ -1217,19 +1257,34 @@ function logout() { localStorage.removeItem('sr_token'); token = ''; location.re
 
 // ---------- chat ----------
 async function loadModels() {
-  const { res, data } = await api('/v1/models');
+  const { res, data } = await api('/v1/models/raw');
   if (!res.ok) return;
-  models = data.data;
+  allModels = data.data || [];
+  const defaultModel = data.default_model || (allModels[0] && allModels[0].id) || '';
+  // default: saare models selected (user chahta hai full rotation ready)
+  selectedModels = allModels.map(m => m.id);
+  renderModelChips();
+  renderPickerProviders();
+}
+let allModels = [];
+let selectedModels = [];
+
+function renderModelChips() {
   const list = document.getElementById('modelList');
   list.innerHTML = '';
-  models.forEach(m => {
+  if (selectedModels.length === 0) {
+    list.innerHTML = '<span class="muted">Koi model select nahi — 🎯 Pick Models dabao</span>';
+  }
+  selectedModels.forEach(id => {
+    const m = allModels.find(x => x.id === id);
     const chip = document.createElement('label');
     chip.className = 'chip checked';
-    chip.innerHTML = `<input type="checkbox" class="m-cb" value="${m.id}" checked>${m.id}<span class="tag">${m.owned_by}</span>`;
+    chip.innerHTML = `${id}<span class="tag">${m ? m.owned_by : '?'}</span><span style="cursor:pointer" onclick="removePick('${id.replace(/'/g, "\\'")}')" title="hatao">✕</span>`;
     list.appendChild(chip);
   });
+  const c = document.getElementById('pickCount');
+  if (c) c.textContent = selectedModels.length;
 }
-function selectedModels() { return Array.from(document.querySelectorAll('.m-cb:checked')).map(c => c.value); }
 async function send() {
   const text = document.getElementById('prompt').value.trim();
   if (!text && images.length === 0) return;
@@ -1240,13 +1295,61 @@ async function send() {
   document.getElementById('sendBtn').disabled = true;
   const { res, data } = await api('/v1/chat/completions', {
     method: 'POST',
-    body: JSON.stringify({ models: selectedModels(), messages: [{ role: 'user', content }] })
+    body: JSON.stringify({ models: selectedModels, messages: [{ role: 'user', content }] })
   });
   if (!res.ok) addMsg('ai', '⚠️ ' + (data.detail || ('Error ' + res.status)));
   else addMsg('ai', data.choices[0].message.content, [], `⚡ ${data.provider} · ${data.model} · ${data.key}`);
   document.getElementById('sendBtn').disabled = false;
   document.getElementById('prompt').value = '';
   images = []; document.getElementById('thumbs').innerHTML = '';
+}
+
+// ---------- model picker (modal) ----------
+let pickFilter = 'all';
+function openModelPicker() {
+  renderPickerProviders();
+  renderPickerList();
+  document.getElementById('modelPicker').style.display = 'flex';
+}
+function closeModelPicker() { document.getElementById('modelPicker').style.display = 'none'; }
+function renderPickerProviders() {
+  const provs = Array.from(new Set(allModels.map(m => m.owned_by))).sort();
+  const box = document.getElementById('pickProviders');
+  box.innerHTML = `<button class="btn sec" style="padding:4px 10px;font-size:12px" onclick="setPickFilter('all')">All</button>`;
+  provs.forEach(p => {
+    box.innerHTML += `<button class="btn sec" style="padding:4px 10px;font-size:12px;${pickFilter === p ? 'border-color:var(--accent);color:var(--accent2)' : ''}" onclick="setPickFilter('${p.replace(/'/g, "\\'")}')">${p}</button>`;
+  });
+}
+function setPickFilter(p) { pickFilter = p; renderPickerProviders(); renderPickerList(); }
+function renderPickerList() {
+  const q = (document.getElementById('pickSearch').value || '').toLowerCase().trim();
+  const list = document.getElementById('pickList');
+  list.innerHTML = '';
+  allModels.filter(m => (pickFilter === 'all' || m.owned_by === pickFilter) && (!q || m.id.toLowerCase().includes(q)))
+    .forEach(m => {
+      const on = selectedModels.includes(m.id);
+      const div = document.createElement('div');
+      div.className = 'pick-item' + (on ? ' on' : '');
+      div.innerHTML = `<input type="checkbox" ${on ? 'checked' : ''} onchange="togglePick('${m.id.replace(/'/g, "\\'")}', this.checked)"><span class="id">${m.id}</span><span class="tag">${m.owned_by}</span>`;
+      list.appendChild(div);
+    });
+  const st = document.getElementById('pickStatus');
+  st.textContent = selectedModels.length + ' selected';
+}
+function togglePick(id, on) {
+  const i = selectedModels.indexOf(id);
+  if (on && i < 0) selectedModels.push(id);
+  if (!on && i >= 0) selectedModels.splice(i, 1);
+  renderPickerList();
+  renderModelChips();
+}
+function pickAll() { selectedModels = allModels.map(m => m.id); renderPickerList(); renderModelChips(); }
+function pickNone() { selectedModels = []; renderPickerList(); renderModelChips(); }
+function applyPicks() { closeModelPicker(); renderModelChips(); }
+function removePick(id) {
+  const i = selectedModels.indexOf(id);
+  if (i >= 0) selectedModels.splice(i, 1);
+  renderModelChips(); renderPickerList();
 }
 function addMsg(role, text, imgs = [], meta = null) {
   const box = document.getElementById('messages');

@@ -47,13 +47,18 @@ providers:
     api_keys:
       - "PASTE_OPENROUTER_KEY_1"
 
-  # ---------- OPENCODE ZEN (free gateway, 100 RPD) ----------
+  # ---------- OPENCODE ZEN (opencode.ai — OpenAI-compatible gateway) ----------
+  # Key env var se: ZEN_KEYS="sk-..." (Render secret / local env). Config me
+  # kabhi real key mat daalo — repo PUBLIC hai!
   - name: zen
     type: openai
     base_url: https://opencode.ai/zen/v1
     models:
-      - opencode/big-pickle
-      # - opencode/deepseek-v4-flash-free
+      - big-pickle
+      - glm-5.2
+      - kimi-k3
+      - deepseek-v4-pro
+      - qwen3.7-plus
     api_keys:
       - "PASTE_ZEN_KEY_1"
 
