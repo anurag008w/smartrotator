@@ -1,0 +1,58 @@
+# Render Blueprint — SmartRotator (auth + per-user quota + dashboard)
+#
+# STEP 1: Render me ek FREE PostgreSQL banao (Dashboard → New → PostgreSQL)
+#         uske Internal Database URL ko DATABASE_URL me daalo.
+#         ⚠️ Free Postgres 30 din me expire hota hai — production ke liye $7/mo.
+#
+# STEP 2: Secrets set karo:
+#   GEMINI_KEYS="key1,key2,key3"
+#   GROQ_KEYS="key1,key2"
+#   OPENROUTER_KEYS="key1"
+#   ZEN_KEYS="key1"
+#   JWT_SECRET="random-long-secret-string"
+#   ADMIN_USERS="yourname"        (optional, comma separated)
+
+services:
+  - type: web
+    name: smartrotator
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn rotator.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ROTATOR_CONFIG
+        value: config.yaml
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smartrotator-db
+          property: connectionString
+      - key: GEMINI_KEYS
+        sync: false
+      - key: GROQ_KEYS
+        sync: false
+      - key: OPENROUTER_KEYS
+        sync: false
+      - key: ZEN_KEYS
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_USERS
+        sync: false
+
+  # Free PostgreSQL (30 din expiry — baad upgrade karna hoga)
+  - type: postgres
+    name: smartrotator-db
+    plan: free
+
+  # Keep-alive: har 10 min me ping (free tier sleep na ho)
+  - type: cron
+    name: smartrotator-keepalive
+    runtime: python
+    plan: free
+    schedule: "*/10 * * * *"
+    buildCommand: ""
+    startCommand: python keepalive.py
+    envVars:
+      - key: PING_URL
+        value: https://smartrotator.onrender.com/health

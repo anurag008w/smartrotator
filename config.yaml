@@ -1,0 +1,98 @@
+# ============================================================
+#  SmartRotator Configuration
+#  API keys yahan daalo — multiple keys per provider allowed!
+#  Keys env vars se bhi aayengi (Render pe secret daalo):
+#    GEMINI_KEYS="key1,key2,key3"
+#    GROQ_KEYS="key1,key2"
+#    OPENROUTER_KEYS="key1"
+#    ZEN_KEYS="key1"
+#  Config me placeholder chhod do, env var override kar dega.
+# ============================================================
+
+rotation:
+  strategy: round_robin        # round_robin | random | health
+  provider_strategy: sequential # sequential (ek provider drain karo, phir agli) | round_robin
+  cooldown_seconds: 60         # 429/500 ke baad kitni der key ko chill do
+  max_fallback_attempts: 16    # ek request me kitni baar doosra key/model/provider try kare
+  fail_after_attempts: 3       # kitne consecutive fails pe key ko temporary banish karo
+
+providers:
+  # ---------- GOOGLE GEMINI (best free tier: 1500 RPD, vision native) ----------
+  - name: gemini
+    type: gemini
+    models:
+      - gemini-2.5-flash        # fast + vision + image input
+      # - gemini-2.5-pro        # strong, but sirf 50 RPD free me
+    api_keys:
+      - "PASTE_GEMINI_KEY_1"
+      # - "PASTE_GEMINI_KEY_2"  # multiple keys = zyada quota
+
+  # ---------- GROQ (fastest, 1000 RPD per key per model) ----------
+  - name: groq
+    type: openai
+    base_url: https://api.groq.com/openai/v1
+    models:
+      - llama-3.3-70b-versatile
+      - meta-llama/llama-4-scout-17b-16e-instruct   # VISION support (20MB images)
+    api_keys:
+      - "PASTE_GROQ_KEY_1"
+
+  # ---------- OPENROUTER (28+ free models, 50 RPD) ----------
+  - name: openrouter
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    models:
+      - meta-llama/llama-4-maverick:free            # VISION support
+      # - deepseek/deepseek-r1:free
+    api_keys:
+      - "PASTE_OPENROUTER_KEY_1"
+
+  # ---------- OPENCODE ZEN (free gateway, 100 RPD) ----------
+  - name: zen
+    type: openai
+    base_url: https://opencode.ai/zen/v1
+    models:
+      - opencode/big-pickle
+      # - opencode/deepseek-v4-flash-free
+    api_keys:
+      - "PASTE_ZEN_KEY_1"
+
+# ------------------------------------------------------------
+#  IP ROTATION (optional)
+#  LLM providers rate-limit per API KEY, not per IP.
+#  Isliye default OFF hai — free proxies mostly block hote hain
+#  aur kaam ke bajaye request kharab karte hain.
+#  Agar kabhi paid residential gateway ho (Shifter, DataImpulse),
+#  bas proxies.txt me daalo ya file path batao, on karo. Done.
+# ------------------------------------------------------------
+proxy:
+  enabled: false               # false = sirf key rotation (recommended on Render)
+  mode: file                   # file | proxifly (free auto-fetch)
+  file: proxies.txt            # file mode: har line me "host:port"
+  proxifly_url: https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt
+  rotate_every_request: true   # true = har request pe naya IP
+  max_proxy_attempts: 3        # dead proxy skip karke kitne try kare
+  quarantine_failures: 3       # itne fails pe proxy ko reject karo
+  timeout_seconds: 8
+
+# ------------------------------------------------------------
+#  User Authentication & Quotas
+#  Har user: login → JWT + apni sk- API key
+#  App integration: base_url = server/v1 + user ki key
+#  Quota per-user per-day, dashboard pe dikhta hai
+# ------------------------------------------------------------
+auth:
+  enabled: true
+  default_daily_limit: 50        # naye user ko kitne requests/day
+  jwt_secret_env: JWT_SECRET     # env var me daalo (Render secret)
+  admin_usernames_env: ADMIN_USERS  # comma-separated env var (optional)
+  jwt_hours: 24                  # session kitni der valid
+
+# ------------------------------------------------------------
+#  Server (Render ke liye)
+# ------------------------------------------------------------
+server:
+  host: 0.0.0.0
+  port: 8000
+  default_model: gemini-2.5-flash   # jab client model specify na kare
+  allow_model_routing: true         # client ko koi bhi configured model allow karo
