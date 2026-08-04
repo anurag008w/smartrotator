@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 
 from . import github_sync
 from . import store as database
+from . import usersync
 from .catalog import MODEL_CATALOG
 from .auth import (
     create_jwt,
@@ -179,6 +180,12 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class SyncStateRequest(BaseModel):
+    """App-side push-authoritative: poora user state server ko bheja jata hai."""
+    state: dict = {}
+    updated_at: str = ""
 
 
 class SetLimitRequest(BaseModel):
@@ -365,6 +372,59 @@ async def change_password(req: ChangePasswordRequest, request: Request):
     if updated is None:
         raise HTTPException(status_code=404, detail="User not found")
     return {"ok": True, "message": "Password update ho gaya"}
+
+
+# --------------------------------------------------------------------------
+# Sync endpoints (offline-first app backup — per-user, push-authoritative)
+# --------------------------------------------------------------------------
+@app.get("/sync/status")
+async def sync_status(request: Request, scope: str = "state"):
+    """User ke ek scope ka sync status — app decide kare local aage hai ya peeche."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    status = await usersync.sync_status(user.username, scope)
+    return {"username": user.username, **status}
+
+
+@app.get("/sync/scopes")
+async def sync_scopes(request: Request):
+    """User folder me kaunse scopes sync hain (fresh install pe pull list)."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    scopes = await usersync.list_user_scopes(user.username)
+    return {"username": user.username, "scopes": scopes}
+
+
+@app.get("/sync/state")
+async def sync_get_state(request: Request, scope: str = "state"):
+    """User ke ek scope ka saved data (fresh install / naye device pe pull)."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    record = await usersync.get_user_scope(user.username, scope)
+    if record is None:
+        return {"username": user.username, "scope": scope, "exists": False, "updated_at": "", "state": {}}
+    return {"username": user.username, "scope": scope, "exists": True, **record}
+
+
+@app.put("/sync/state")
+async def sync_put_state(req: SyncStateRequest, request: Request, scope: str = "state"):
+    """User ke ek scope ka data save karo — server bas store karta hai (last-write-wins)."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    saved = await usersync.save_user_scope(user.username, scope, req.state, req.updated_at)
+    return {"username": user.username, **saved}
+
+
+@app.delete("/sync/state")
+async def sync_delete_state(request: Request, scope: str = "state"):
+    """Ek scope delete karo. Agar scope='*' ho toh poora user data wipe."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    if scope == "*":
+        deleted = await usersync.delete_user_all(user.username)
+    else:
+        deleted = await usersync.delete_user_scope(user.username, scope)
+    return {"username": user.username, "scope": scope, "deleted": deleted}
 
 
 # --------------------------------------------------------------------------
@@ -757,6 +817,44 @@ async def admin_refresh_all_models(request: Request):
         except Exception as exc:  # noqa: BLE001
             results.append({"name": name, "count": 0, "error": str(exc)})
     return {"ok": True, "results": results}
+
+
+@app.get("/admin/sync/enc-key")
+async def admin_get_enc_key(request: Request):
+    """SYNC_ENC_KEY secret dekh lo (yaad rakhne ki zaroorat nahi).
+
+    Secret 3 sources se milta hai:
+      - env SYNC_ENC_KEY (Render secret) — sabse high priority
+      - file data/.sync-enc-key (auto-generated hidden file) — GitHub sync skip
+      - nahi hai toh abhi generate + persist
+    Ye secret sirf ADMIN ko dikhta hai.
+    """
+    await _require_admin(request)
+    secret, source = usersync.get_or_create_secret()
+    return {
+        "set": True,
+        "source": source,
+        "secret": secret,
+        "hint": "Isko Render me SYNC_ENC_KEY secret ke roop me daal sakte ho (optional — file-based bhi persist karta hai).",
+    }
+
+
+@app.post("/admin/sync/enc-key/rotate")
+async def admin_rotate_enc_key(request: Request):
+    """Naya secret banao aur file me save karo.
+
+    WARNING: purana encrypted data nayi key se unlock nahi hoga — users ko
+    phir se login + re-sync karna padega. Sirf tabhi use karo jab zaroori ho.
+    """
+    await _require_admin(request)
+    secret, source = usersync.rotate_secret()
+    return {
+        "set": True,
+        "source": source,
+        "secret": secret,
+        "warning": "Nayi key file me set ho gayi. Purana encrypted sync data ab unlock nahi hoga — users re-login karein.",
+        "env_override": bool(os.environ.get("SYNC_ENC_KEY", "").strip()),
+    }
 
 
 # --------------------------------------------------------------------------
