@@ -88,7 +88,7 @@ proxy:
 # ------------------------------------------------------------
 auth:
   enabled: true
-  default_daily_limit: 50        # naye user ko kitne requests/day
+  default_daily_limit: 30        # naye user ko kitne requests/day
   jwt_secret_env: JWT_SECRET     # env var me daalo (Render secret)
   admin_usernames_env: ADMIN_USERS  # comma-separated env var (optional)
   jwt_hours: 24                  # session kitni der valid

@@ -36,6 +36,7 @@ _lock = asyncio.Lock()
 # in-memory data (files se load hota hai startup pe)
 _users: dict[int, dict] = {}          # id -> user dict
 _next_id: int = 1
+_migrations: list[str] = []           # apply ho chuki migrations (users.json me persist)
 _usage: dict[int, dict[str, dict]] = {}   # user_id -> {day: {"requests":n, "tokens":n}}
 _managed: dict = {"provider_models": {}, "provider_order": [], "groups": []}
 _custom_providers: list[dict] = []    # admin dashboard se add kiye providers
@@ -52,7 +53,7 @@ class User:
     salt: str
     api_key: str
     role: str = "user"
-    daily_limit: int = 50
+    daily_limit: int = 30
     created_at: str = ""
 
     @property
@@ -119,6 +120,10 @@ async def init_db() -> None:
         if raw.get("next_id"):
             _next_id = max(_next_id, int(raw["next_id"]))
 
+        _migrations.clear()
+        _migrations.extend(raw.get("_migrations", []) or [])
+        _apply_pending_migrations_locked()
+
         _usage.clear()
         _usage.update(_read_json(USAGE_FILE, {}))
 
@@ -139,7 +144,7 @@ def _user_from_dict(u: dict) -> User:
         salt=u["salt"],
         api_key=u["api_key"],
         role=u.get("role", "user"),
-        daily_limit=int(u.get("daily_limit", 50)),
+        daily_limit=int(u.get("daily_limit", 30)),
         created_at=u.get("created_at", ""),
     )
 
@@ -174,7 +179,7 @@ async def create_user(
     password_hash: str,
     salt: str,
     api_key: str,
-    daily_limit: int = 50,
+    daily_limit: int = 30,
     role: str = "user",
 ) -> User:
     global _next_id
@@ -254,8 +259,30 @@ async def set_role(user_id: int, role: str) -> Optional[User]:
 def _persist_users_locked() -> None:
     _write_json(
         USERS_FILE,
-        {"next_id": _next_id, "users": sorted(_users.values(), key=lambda x: x["id"])},
+        {
+            "next_id": _next_id,
+            "_migrations": _migrations,
+            "users": sorted(_users.values(), key=lambda x: x["id"]),
+        },
     )
+
+
+# --------------------------------------------------------------------------
+# Data migrations (ek-baar wale changes — flag se track, har startup pe nahi)
+# --------------------------------------------------------------------------
+def _apply_pending_migrations_locked() -> None:
+    """Pending migrations apply karo (lock ke andar call karna)."""
+    changed = False
+    if "limits_30" not in _migrations:
+        # sab non-admin users ki daily limit 30 karo (naya default).
+        # Admin-set custom limits override na ho — bas ek baar hota hai.
+        for u in _users.values():
+            if u.get("role", "user") != "admin":
+                u["daily_limit"] = 30
+        _migrations.append("limits_30")
+        changed = True
+    if changed:
+        _persist_users_locked()
 
 
 # --------------------------------------------------------------------------

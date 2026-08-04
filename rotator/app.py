@@ -287,11 +287,16 @@ async def register(req: RegisterRequest):
     if existing:
         raise HTTPException(status_code=409, detail="Username already taken")
 
-    # first user = admin (self-hosted pattern)
-    count = await database.count_users()
-    role = "admin" if count == 0 else "user"
+    # role: env ADMIN_USERS me naam ho → admin. Env set hai toh koi bhi
+    # random pehla user auto-admin NAHI banega (sirf owner). Env khali
+    # (local dev / self-host) pe pehla registered user admin hota hai.
     if req.username in settings["admin_usernames"]:
         role = "admin"
+    elif settings["admin_usernames"]:
+        role = "user"
+    else:
+        count = await database.count_users()
+        role = "admin" if count == 0 else "user"
 
     password_hash, salt = hash_password(req.password)
     user = await database.create_user(
@@ -306,7 +311,12 @@ async def register(req: RegisterRequest):
     token = create_jwt(
         user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
     )
-    return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
+    return {
+        "token": token,
+        "api_key": user.api_key,
+        "user": _user_public(user),
+        "is_super_admin": _is_super_admin(user, settings),
+    }
 
 
 @app.post("/auth/login")
@@ -322,7 +332,12 @@ async def login(req: LoginRequest):
     token = create_jwt(
         user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
     )
-    return {"token": token, "api_key": user.api_key, "user": _user_public(user)}
+    return {
+        "token": token,
+        "api_key": user.api_key,
+        "user": _user_public(user),
+        "is_super_admin": _is_super_admin(user, settings),
+    }
 
 
 @app.get("/auth/me")
@@ -334,6 +349,7 @@ async def auth_me(request: Request):
     history = await database.get_usage_between(user.id, 7)
     return {
         "user": _user_public(user),
+        "is_super_admin": _is_super_admin(user, settings),
         "api_key": user.api_key,
         "today": {"day": today, "requests": row.requests, "tokens": row.tokens},
         "history": [
@@ -434,7 +450,7 @@ async def sync_delete_state(request: Request, scope: str = "state"):
 async def admin_users(request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
-    if not user.is_admin:
+    if not _is_super_admin(user, settings):
         raise HTTPException(status_code=403, detail="Admin only")
 
     users = await database.list_users()
@@ -460,7 +476,7 @@ async def admin_users(request: Request):
 async def admin_set_limit(user_id: int, req: SetLimitRequest, request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
-    if not user.is_admin:
+    if not _is_super_admin(user, settings):
         raise HTTPException(status_code=403, detail="Admin only")
 
     target = await database.set_daily_limit(user_id, req.daily_limit)
@@ -483,10 +499,43 @@ async def admin_set_role(user_id: int, req: SetRoleRequest, request: Request):
 # --------------------------------------------------------------------------
 # Model Manager admin endpoints (dashboard Models tab)
 # --------------------------------------------------------------------------
+def _is_super_admin(user, settings: dict) -> bool:
+    """Admin PANEL ka access — sirf env/ADMIN_USERS me naam wale users ko.
+
+    - Agar ADMIN_USERS env/config set hai (Render pe): sirf wahi users panel
+      dekhenge. Role se promote kiye hue admins panel NAHI dekh payenge
+      (par quota unlimited rahega).
+    - Agar env/config khali hai (local dev): role-admin fallback — pehla
+      registered user hi admin.
+    """
+    admins = settings.get("admin_usernames") or set()
+    if admins:
+        return user.username in admins
+    return user.is_admin
+
+
+def _is_admin(user, settings: dict) -> bool:
+    """Koi bhi admin — env wala super admin YA role=admin wala.
+
+    Models panel (group editor + live models) ke liye dono ko access hai.
+    """
+    return _is_super_admin(user, settings) or user.is_admin
+
+
 async def _require_admin(request: Request):
+    """SIRF super admin (env ADMIN_USERS) — Users & Quotas, providers, enc-key."""
     settings = _auth_settings()
     user = await _require_user(request, settings)
-    if not user.is_admin:
+    if not _is_super_admin(user, settings):
+        raise HTTPException(status_code=403, detail="Admin only")
+    return user
+
+
+async def _require_any_admin(request: Request):
+    """Koi bhi admin — Models panel (super admin + promoted admin)."""
+    settings = _auth_settings()
+    user = await _require_user(request, settings)
+    if not _is_admin(user, settings):
         raise HTTPException(status_code=403, detail="Admin only")
     return user
 
@@ -494,7 +543,7 @@ async def _require_admin(request: Request):
 @app.get("/admin/models")
 async def admin_models(request: Request):
     """Dashboard ke liye: catalog + current managed config + provider/key counts."""
-    await _require_admin(request)
+    await _require_any_admin(request)
 
     rotator: Rotator = request.app.state.rotator
     managed = await database.load_managed_config()
@@ -544,7 +593,7 @@ async def admin_models(request: Request):
 @app.put("/admin/models")
 async def admin_save_models(req: SaveModelsRequest, request: Request):
     """Dashboard se save — models/groups/order apply karo (config.yaml touch nahi)."""
-    await _require_admin(request)
+    await _require_any_admin(request)
 
     # groups ko pydantic → plain dicts (member: provider + models queue + keys)
     groups = []
@@ -806,7 +855,7 @@ async def admin_fetch_models(name: str, request: Request):
 @app.post("/admin/providers/refresh-all")
 async def admin_refresh_all_models(request: Request):
     """Saare configured providers ke live models refresh karo (force)."""
-    await _require_admin(request)
+    await _require_any_admin(request)
     rotator: Rotator = request.app.state.rotator
     names = [st.cfg.name for st in rotator.providers]
     results = []
@@ -1192,8 +1241,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="tab active" onclick="showView('chat')">💬 Chat</div>
       <div class="tab" onclick="showView('usage'); loadMe();">📊 Usage</div>
       <div class="tab" onclick="showView('settings')">⚙️ Settings</div>
-      <div class="tab" id="adminTab" style="display:none" onclick="showView('admin'); loadAdmin();">🛡 Admin</div>
       <div class="tab" id="modelsTab" style="display:none" onclick="showView('models'); loadModelsAdmin();">🧠 Models</div>
+      <div class="tab" id="adminTab" style="display:none" onclick="showView('admin'); loadAdmin();">🛡 Admin</div>
     </div>
 
     <!-- CHAT -->
@@ -1342,11 +1391,15 @@ function showAuth() {
   document.getElementById('view-main').style.display = 'none';
   document.getElementById('userChip').textContent = '';
 }
-function showMain(user) {
+function showMain(user, isSuperAdmin) {
   document.getElementById('view-auth').style.display = 'none';
   document.getElementById('view-main').style.display = 'block';
-  document.getElementById('userChip').textContent = '👤 ' + user.username + (user.role === 'admin' ? ' ⭐ admin' : '');
-  if (user.role === 'admin') { document.getElementById('adminTab').style.display = ''; document.getElementById('modelsTab').style.display = ''; }
+  document.getElementById('userChip').textContent = '👤 ' + user.username + (isSuperAdmin ? ' 👑 super admin' : (user.role === 'admin' ? ' ⭐ admin' : ''));
+  // Tabs: user → bas Chat/Usage/Settings. Models → koi bhi admin
+  // (env wala YA promote hua). Users & Quotas (Admin) → SIRF env wala.
+  const isAnyAdmin = isSuperAdmin || user.role === 'admin';
+  document.getElementById('modelsTab').style.display = isAnyAdmin ? '' : 'none';
+  document.getElementById('adminTab').style.display = isSuperAdmin ? '' : 'none';
 }
 function authTab(which) {
   document.getElementById('tab-login').classList.toggle('active', which === 'login');
@@ -1367,7 +1420,7 @@ async function doRegister() {
 function afterAuth(data) {
   token = data.token; localStorage.setItem('sr_token', token);
   document.getElementById('api-key').value = data.api_key;
-  showMain(data.user); showView('chat'); loadModels(); loadMe();
+  showMain(data.user, data.is_super_admin); showView('chat'); loadModels(); loadMe();
 }
 function logout() { localStorage.removeItem('sr_token'); token = ''; location.reload(); }
 
@@ -1376,7 +1429,7 @@ function logout() { localStorage.removeItem('sr_token'); token = ''; location.re
   if (token) {
     const { res, data } = await api('/auth/me');
     if (res.ok) {
-      showMain(data.user);
+      showMain(data.user, data.is_super_admin);
       document.getElementById('api-key').value = data.api_key || '';
       updateCodeSample();
       loadModels(); loadMe();
@@ -1385,13 +1438,27 @@ function logout() { localStorage.removeItem('sr_token'); token = ''; location.re
 })();
 
 // ---------- chat ----------
+function persistPicks() {
+  // selection localStorage me yaad rakh — refresh/login pe auto-reset na ho
+  try { localStorage.setItem('sr_models', JSON.stringify(selectedModels)); } catch (e) {}
+}
 async function loadModels() {
   const { res, data } = await api('/v1/models/raw');
   if (!res.ok) return;
   allModels = data.data || [];
   const defaultModel = data.default_model || (allModels[0] && allModels[0].id) || '';
-  // default: saare models selected (user chahta hai full rotation ready)
-  selectedModels = allModels.map(m => m.id);
+  // saved selection restore karo — nahi toh pehli baar saare models (full rotation)
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem('sr_models') || 'null'); } catch (e) { saved = null; }
+  if (Array.isArray(saved) && saved.length) {
+    selectedModels = saved.filter(id => allModels.some(m => m.id === id));
+    if (!selectedModels.length && defaultModel) selectedModels = [defaultModel];
+  } else if (defaultModel) {
+    selectedModels = [defaultModel];
+  } else {
+    selectedModels = allModels.map(m => m.id);
+  }
+  persistPicks();
   renderModelChips();
   renderPickerProviders();
 }
@@ -1417,20 +1484,27 @@ function renderModelChips() {
 async function send() {
   const text = document.getElementById('prompt').value.trim();
   if (!text && images.length === 0) return;
-  addMsg('user', text || '(image only)', images);
+  // pehle hi box clear karo — request slow ho toh bhi message wahi nahi rehta
+  document.getElementById('prompt').value = '';
+  const sentImages = images.slice();
+  addMsg('user', text || '(image only)', sentImages);
   const content = [];
-  images.forEach(i => content.push({ type: 'image_url', image_url: { url: i.dataUrl } }));
+  sentImages.forEach(i => content.push({ type: 'image_url', image_url: { url: i.dataUrl } }));
   if (text) content.push({ type: 'text', text });
   document.getElementById('sendBtn').disabled = true;
-  const { res, data } = await api('/v1/chat/completions', {
-    method: 'POST',
-    body: JSON.stringify({ models: selectedModels, messages: [{ role: 'user', content }] })
-  });
-  if (!res.ok) addMsg('ai', '⚠️ ' + (data.detail || ('Error ' + res.status)));
-  else addMsg('ai', data.choices[0].message.content, [], `⚡ ${data.provider} · ${data.model} · ${data.key}`);
-  document.getElementById('sendBtn').disabled = false;
-  document.getElementById('prompt').value = '';
-  images = []; document.getElementById('thumbs').innerHTML = '';
+  try {
+    const { res, data } = await api('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ models: selectedModels, messages: [{ role: 'user', content }] })
+    });
+    if (!res.ok) addMsg('ai', '⚠️ ' + (data.detail || ('Error ' + res.status)));
+    else addMsg('ai', data.choices[0].message.content, [], `⚡ ${data.provider} · ${data.model} · ${data.key}`);
+  } catch (err) {
+    addMsg('ai', '⚠️ Network error: ' + (err.message || err));
+  } finally {
+    document.getElementById('sendBtn').disabled = false;
+    images = []; document.getElementById('thumbs').innerHTML = '';
+  }
 }
 
 // ---------- model picker (modal) ----------
@@ -1469,15 +1543,17 @@ function togglePick(id, on) {
   const i = selectedModels.indexOf(id);
   if (on && i < 0) selectedModels.push(id);
   if (!on && i >= 0) selectedModels.splice(i, 1);
+  persistPicks();
   renderPickerList();
   renderModelChips();
 }
-function pickAll() { selectedModels = allModels.map(m => m.id); renderPickerList(); renderModelChips(); }
-function pickNone() { selectedModels = []; renderPickerList(); renderModelChips(); }
-function applyPicks() { closeModelPicker(); renderModelChips(); }
+function pickAll() { selectedModels = allModels.map(m => m.id); persistPicks(); renderPickerList(); renderModelChips(); }
+function pickNone() { selectedModels = []; persistPicks(); renderPickerList(); renderModelChips(); }
+function applyPicks() { persistPicks(); closeModelPicker(); renderModelChips(); }
 function removePick(id) {
   const i = selectedModels.indexOf(id);
   if (i >= 0) selectedModels.splice(i, 1);
+  persistPicks();
   renderModelChips(); renderPickerList();
 }
 function addMsg(role, text, imgs = [], meta = null) {
