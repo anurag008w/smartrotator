@@ -980,8 +980,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             raise HTTPException(
                 status_code=429,
                 detail=(
-                    f"Aapka daily quota khatam ho gaya ({user.daily_limit} requests/day). "
-                    "Kal reset hoga, ya admin se badhwa lo."
+                    "Aapka daily quota khatam ho gaya. Kal reset hoga, "
+                    "ya admin se badhwa lo."
                 ),
             )
 
