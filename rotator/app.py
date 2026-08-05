@@ -31,7 +31,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Union
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -209,7 +209,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False  # accepted for compatibility; returns non-streamed
     models: Optional[list[str]] = None  # UI multi-select: rotation inhi models se
     tools: Optional[list[dict]] = None  # function calling (OpenAI format)
-    tool_choice: Optional[dict] = None
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 class RegisterRequest(BaseModel):

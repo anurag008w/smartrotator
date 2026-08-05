@@ -15,7 +15,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -109,7 +109,7 @@ class Provider:
         proxy: Optional[str] = None,
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
-        tool_choice: Optional[dict] = None,
+        tool_choice: Optional[Union[str, dict]] = None,
     ) -> ChatResult:
         raise NotImplementedError
 
@@ -212,7 +212,7 @@ class OpenAICompatibleProvider(Provider):
         proxy: Optional[str] = None,
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
-        tool_choice: Optional[dict] = None,
+        tool_choice: Optional[Union[str, dict]] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError(f"{self.name}: no api key provided", retryable=False)
@@ -341,7 +341,7 @@ class GeminiProvider(Provider):
         proxy: Optional[str] = None,
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
-        tool_choice: Optional[dict] = None,
+        tool_choice: Optional[Union[str, dict]] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError("gemini: no api key provided", retryable=False)

@@ -23,7 +23,7 @@ import os
 import random
 import threading
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import yaml
 
@@ -393,7 +393,7 @@ class Rotator:
         temperature: float = 0.7,
         max_fallback_attempts: Optional[int] = None,
         tools: Optional[list[dict]] = None,
-        tool_choice: Optional[dict] = None,
+        tool_choice: Optional[Union[str, dict]] = None,
     ) -> ChatResult:
         """
         Main entry: send messages, rotating keys+models+providers on failure.
