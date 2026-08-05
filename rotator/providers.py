@@ -121,11 +121,64 @@ class Provider:
         url = proxy if "://" in proxy else f"http://{proxy}"
         return httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0), proxy=url)
 
-    # -- shared error mapping -----------------------------------------------
+    # -- shared response parsing / error mapping -----------------------------
+    @staticmethod
+    def _parse_json_response(resp: httpx.Response, context: str) -> dict:
+        """Response body ko safely JSON me parse karo.
+
+        Kuch platforms 200 pe bhi HTML / plain text / bina JSON body ke
+        respond karte hain. Aisi body pe `resp.json()` JSONDecodeError fekta
+        hai jo pehle unhandled reh kar 500 ban jata tha — ab ProviderError
+        (502) me convert karte hain taaki router doosri key/model try kare.
+        """
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ProviderError(
+                f"{context}: invalid JSON response (status {resp.status_code}): {resp.text[:200]}",
+                status_code=502,
+            ) from exc
+        if not isinstance(data, dict):
+            raise ProviderError(
+                f"{context}: unexpected response body (expected JSON object): {resp.text[:200]}",
+                status_code=502,
+            )
+        return data
+
+    @staticmethod
+    def _extract_error_message(data: dict, context: str) -> str:
+        """OpenAI-style error body se human-readable message nikalo."""
+        err = data.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or str(err)
+            return str(msg)[:300]
+        if err:
+            return str(err)[:300]
+        msg = data.get("message")
+        if msg:
+            return str(msg)[:300]
+        return f"{context}: provider error: {str(data)[:200]}"
+
+    @staticmethod
+    def _check_error_body(data: dict, context: str) -> None:
+        """200 status pe bhi kuch gateways `{"error": ...}` bhejte hain."""
+        if data.get("error") or data.get("message"):
+            raise ProviderError(
+                f"{context}: {Provider._extract_error_message(data, context)}",
+                status_code=502,
+            )
+
     @staticmethod
     def _map_error(exc: httpx.HTTPStatusError, context: str) -> ProviderError:
         code = exc.response.status_code
         body = exc.response.text[:500]
+        # JSON error body hai toh human-readable message nikaalo (logs ke liye)
+        try:
+            data = exc.response.json()
+            if isinstance(data, dict):
+                body = Provider._extract_error_message(data, context)
+        except ValueError:
+            pass
         if code == 429:
             return RateLimitError(f"{context}: rate limited (429): {body}", status_code=429)
         if code in (401, 403):
@@ -185,8 +238,23 @@ class OpenAICompatibleProvider(Provider):
             http = client or self._client
             resp = await http.post(self.endpoint, headers=headers, json=payload)
             resp.raise_for_status()
-            data = resp.json()
-            message = data["choices"][0]["message"]
+            data = self._parse_json_response(resp, self.name)
+            # kuch gateways 200 status pe hi error body bhej dete hain
+            self._check_error_body(data, self.name)
+
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices:
+                raise ProviderError(
+                    f"{self.name}: unexpected response — no 'choices' in body: {resp.text[:200]}",
+                    status_code=502,
+                )
+            first = choices[0] if isinstance(choices[0], dict) else None
+            message = first.get("message") if first else None
+            if not isinstance(message, dict):
+                raise ProviderError(
+                    f"{self.name}: unexpected response — choice has no 'message': {resp.text[:200]}",
+                    status_code=502,
+                )
             text = message.get("content") or ""
             tool_calls = message.get("tool_calls") or []
             usage = data.get("usage", {})
@@ -304,7 +372,8 @@ class GeminiProvider(Provider):
             http = client or self._client
             resp = await http.post(url, headers=headers, params=params, json=body)
             resp.raise_for_status()
-            data = resp.json()
+            data = self._parse_json_response(resp, self.name)
+            self._check_error_body(data, self.name)
             text = self._extract_text(data)
             tool_calls = self._extract_tool_calls(data)
             usage = data.get("usageMetadata", {})
@@ -327,7 +396,8 @@ class GeminiProvider(Provider):
                         url, headers=headers, params=params, json=body
                     )
                     resp2.raise_for_status()
-                    data = resp2.json()
+                    data = self._parse_json_response(resp2, self.name)
+                    self._check_error_body(data, self.name)
                     text = self._extract_text(data)
                     tool_calls = self._extract_tool_calls(data)
                     usage = data.get("usageMetadata", {})
@@ -616,7 +686,7 @@ async def _fetch_live_gemini(
                         url += f"&pageToken={quote(page_token)}"
                     resp = await client.get(url, params={"key": key})
                     resp.raise_for_status()
-                    data = resp.json()
+                    data = Provider._parse_json_response(resp, name)
                     for raw in data.get("models", []):
                         m = _map_gemini_model(raw, name, fetched_at)
                         if m:
@@ -664,7 +734,7 @@ async def _fetch_live_openai(
                         url += f"?after={quote(after)}"
                     resp = await client.get(url, headers=headers)
                     resp.raise_for_status()
-                    data = resp.json()
+                    data = Provider._parse_json_response(resp, name)
                     items = data.get("data", []) if isinstance(data, dict) else []
                     for raw in items:
                         m = _map_openai_model(raw, name, fetched_at)

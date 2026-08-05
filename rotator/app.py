@@ -47,6 +47,7 @@ from .auth import (
     decode_jwt,
     generate_api_key,
     hash_password,
+    is_scrypt_hash,
     is_user_api_key,
     verify_password,
 )
@@ -64,10 +65,23 @@ logger = logging.getLogger("smartrotator")
 
 CONFIG_PATH = os.environ.get("ROTATOR_CONFIG", "config.yaml")
 
+# config.yaml har request pe disk se YAML parse karna slow hai (~25ms) —
+# 30s TTL cache rakh do. Runtime me config.yaml change nahi hota (managed
+# config DB me rehta hai), isliye 30s freshness kaafi hai.
+CONFIG_CACHE_TTL = 30.0
+_config_cache: dict = {"t": 0.0, "data": {}}
+
 
 def _load_config() -> dict:
+    now = time.time()
+    cached = _config_cache
+    if now - cached["t"] < CONFIG_CACHE_TTL:
+        return cached["data"]
     with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        data = yaml.safe_load(fh) or {}
+    _config_cache["t"] = now
+    _config_cache["data"] = data
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -135,6 +149,32 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --------------------------------------------------------------------------
+# Global exception handler — koi bhi unhandled error raw 500 na dikhe
+#
+# Pehle provider parsing me kuch edge-cases (galat schema, non-JSON body,
+# 200-pe-error) unhandled exceptions fek dete the → user ko plain
+# "Internal Server Error" milta tha. Root causes ab providers.py me fix hain,
+# par ye safety net rakhna acha hai: koi bhi unexpected exception log ho
+# aur JSON body ke saath aaye (raw 500 ki jagah).
+# --------------------------------------------------------------------------
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):  # noqa: BLE001
+    logger.exception(
+        "Unhandled error on %s %s: %s", request.method, request.url.path, exc
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": (
+                "Server me ek unexpected error aayi. Ye bug ho sakta hai — "
+                "logs me traceback dekh kar batao, fix kar dungi. "
+                "Agar ye provider response ki wajah se hai, thodi der baad try karo."
+            )
+        },
+    )
 
 
 def _auth_settings() -> dict:
@@ -328,6 +368,13 @@ async def login(req: LoginRequest):
     user = await database.get_user_by_username(req.username)
     if not user or not verify_password(req.password, user.password_hash, user.salt):
         raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    # Purane PBKDF2 hash ko scrypt pe migrate karo (login pe ek baar re-hash)
+    if not is_scrypt_hash(user.password_hash):
+        new_hash, _ = hash_password(req.password, user.salt)
+        migrated = await database.set_password(user.id, new_hash, user.salt)
+        if migrated is not None:
+            user = migrated
 
     token = create_jwt(
         user.id, user.username, user.role, settings["jwt_secret"], settings["jwt_hours"]
@@ -966,7 +1013,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             status_code=503,
             detail=(
                 "Something went wrong — saare AI providers abhi busy/ exhausted hain. "
-                "Thodi der baad try karo, ya apna configured provider use karo."
+                "Thodi der baad try karo, ya apna configured provider use karo. "
+                "(sahi provider error `/status` ya admin panel me dikhta hai)"
             ),
         ) from exc
     except ProviderError as exc:

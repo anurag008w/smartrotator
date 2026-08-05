@@ -471,6 +471,13 @@ class Rotator:
                 retryable=False,
             )
 
+        # Attempts ko poore candidate pool ke hisaab se auto-adjust karo —
+        # taaki "jab tak poora group (member × model × key) exhaust na ho,
+        # tab tak koi error app pe na jaye". Default 16 attempts chhote
+        # setups ke liye theek hai, par bade groups me kaafi na padta.
+        total_pairs = sum(len(ring.keys_as_list()) * len(active) for _, ring, active in candidates)
+        attempts = max(attempts, total_pairs)
+
         for _ in range(attempts):
             provider_pick = self._pick_available_provider(candidates)
             if provider_pick is None:
@@ -507,7 +514,7 @@ class Rotator:
                 if not result.text and not result.tool_calls:
                     ring.report_failure(state, resolved_model)
                     last_error = ProviderError(
-                        f"{st.provider_name}/{resolved_model}: empty reply "
+                        f"{st.cfg.name}/{resolved_model}: empty reply "
                         "(saara token budget thinking me chala gaya — max_tokens "
                         "badha kar try karo)"
                     )
