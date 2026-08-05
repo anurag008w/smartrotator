@@ -46,6 +46,10 @@ class ChatMessage:
     tool_calls: list[dict] = field(default_factory=list)  # assistant → model ke calls
     tool_call_id: str = ""               # tool result message me
     name: str = ""                       # tool result message me (function name)
+    # Reasoning models (DeepSeek R1 etc.) ka thinking output — DeepSeek API
+    # ko tool-call ke baad wale requests me `reasoning_content` WAPAS bhejna
+    # MUST hai (warna 400). Isliye ise round-trip preserve karna zaroori.
+    reasoning_content: str = ""
 
 
 @dataclass
@@ -57,6 +61,7 @@ class ChatResult:
     usage: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
     tool_calls: list[dict] = field(default_factory=list)  # OpenAI format
+    reasoning_content: str = ""          # thinking output (alag rakho — content me mix nahi)
 
 
 # --------------------------------------------------------------------------
@@ -291,6 +296,11 @@ class OpenAICompatibleProvider(Provider):
             # kuch na bache toh router empty treat karke agli key/model try
             # karega.
             text = (message.get("content") or "").strip()
+            # DeepSeek R1 jaise reasoning models content ke alawa
+            # `reasoning_content` bhejte hain (thinking output). Isse visible
+            # content me KABHI mix mat karo — alag field me rakho taaki client
+            # ise wapas pass kar sake (tool-loop round-trip ke liye MUST).
+            reasoning = (message.get("reasoning_content") or "").strip()
             tool_calls = message.get("tool_calls") or []
             usage = data.get("usage", {})
             return ChatResult(
@@ -301,6 +311,7 @@ class OpenAICompatibleProvider(Provider):
                 usage=usage,
                 raw=data,
                 tool_calls=tool_calls,
+                reasoning_content=reasoning,
             )
         except httpx.HTTPStatusError as exc:
             raise self._map_error(exc, self.name) from exc
@@ -321,13 +332,19 @@ class OpenAICompatibleProvider(Provider):
             }
 
         if msg.tool_calls:
-            # assistant ne tools call kiye the
+            # assistant ne tools call kiye the — DeepSeek ko ise wapas bhejte
+            # waqt `reasoning_content` bhi chahiye (warna 400). preserve karo.
             out: dict = {"role": "assistant", "content": msg.content or None}
             out["tool_calls"] = msg.tool_calls
+            if msg.reasoning_content:
+                out["reasoning_content"] = msg.reasoning_content
             return out
 
         if not msg.images and not msg.files:
-            return {"role": msg.role, "content": msg.content}
+            out: dict = {"role": msg.role, "content": msg.content}
+            if msg.role == "assistant" and msg.reasoning_content:
+                out["reasoning_content"] = msg.reasoning_content
+            return out
 
         content: list[dict] = [{"type": "text", "text": msg.content}]
         for img in msg.images:
@@ -426,6 +443,7 @@ class GeminiProvider(Provider):
             self._check_error_body(data, self.name)
             text = self._extract_text(data)
             tool_calls = self._extract_tool_calls(data)
+            reasoning = self._extract_thoughts(data)
             usage = data.get("usageMetadata", {})
             thoughts = usage.get("thoughtsTokenCount", 0) or 0
             finish_reason = ""
@@ -450,6 +468,7 @@ class GeminiProvider(Provider):
                     self._check_error_body(data, self.name)
                     text = self._extract_text(data)
                     tool_calls = self._extract_tool_calls(data)
+                    reasoning = self._extract_thoughts(data)
                     usage = data.get("usageMetadata", {})
                 except httpx.HTTPStatusError as exc2:
                     # model thinkingConfig support nahi karta — original reply
@@ -464,6 +483,7 @@ class GeminiProvider(Provider):
                 usage=usage,
                 raw=data,
                 tool_calls=tool_calls,
+                reasoning_content=reasoning,
             )
         except httpx.HTTPStatusError as exc:
             raise self._map_error(exc, self.name) from exc
@@ -570,11 +590,22 @@ class GeminiProvider(Provider):
 
     @staticmethod
     def _extract_text(data: dict) -> str:
+        # `thought: true` parts model ki thinking hoti hai — use visible content
+        # me KABHI mat mix karo. Sirf asli answer join hota hai.
         try:
             parts = data["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts).strip()
         except (KeyError, IndexError):
             return ""
+        return "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+
+    @staticmethod
+    def _extract_thoughts(data: dict) -> str:
+        """Gemini thinking parts (`thought: true`) → reasoning_content."""
+        try:
+            parts = data["candidates"][0]["content"]["parts"]
+        except (KeyError, IndexError):
+            return ""
+        return "\n".join(p.get("text", "") for p in parts if p.get("thought")).strip()
 
     @staticmethod
     def _extract_tool_calls(data: dict) -> list[dict]:

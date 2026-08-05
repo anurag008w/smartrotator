@@ -1064,6 +1064,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                         "role": "assistant",
                         "content": result.text,
                         **({"tool_calls": result.tool_calls} if result.tool_calls else {}),
+                        **({"reasoning_content": result.reasoning_content} if result.reasoning_content else {}),
                     },
                     "finish_reason": "tool_calls" if result.tool_calls else "stop",
                 }
@@ -1138,6 +1139,9 @@ def _convert_message(m: dict) -> ChatMessage:
     tool_calls = m.get("tool_calls") or []
     tool_call_id = m.get("tool_call_id") or ""
     name = m.get("name") or ""
+    # DeepSeek round-trip: client assistant message ke saath reasoning_content
+    # wapas bhejta hai — drop mat karo, warna agli request pe provider 400 dega.
+    reasoning_content = m.get("reasoning_content") or ""
 
     if isinstance(content, str):
         text = content
@@ -1185,6 +1189,7 @@ def _convert_message(m: dict) -> ChatMessage:
         tool_calls=tool_calls,
         tool_call_id=tool_call_id,
         name=name,
+        reasoning_content=reasoning_content,
     )
 
 
