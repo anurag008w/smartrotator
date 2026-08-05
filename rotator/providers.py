@@ -255,7 +255,12 @@ class OpenAICompatibleProvider(Provider):
                     f"{self.name}: unexpected response — choice has no 'message': {resp.text[:200]}",
                     status_code=502,
                 )
-            text = message.get("content") or ""
+            # content ko strip karo — reasoning models aage/peeche whitespace
+            # chhodte hain (aur thinking-budget khatam hone pe sirf whitespace
+            # bhi aata hai). Clean text hi user tak jaaye; agar strip ke baad
+            # kuch na bache toh router empty treat karke agli key/model try
+            # karega.
+            text = (message.get("content") or "").strip()
             tool_calls = message.get("tool_calls") or []
             usage = data.get("usage", {})
             return ChatResult(
@@ -522,7 +527,7 @@ class GeminiProvider(Provider):
     def _extract_text(data: dict) -> str:
         try:
             parts = data["candidates"][0]["content"]["parts"]
-            return "".join(p.get("text", "") for p in parts)
+            return "".join(p.get("text", "") for p in parts).strip()
         except (KeyError, IndexError):
             return ""
 
