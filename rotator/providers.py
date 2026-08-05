@@ -389,7 +389,7 @@ class GeminiProvider(Provider):
             # thinkingBudget: 0 se thinking band karke seedha answer milta hai —
             # bas kuch models (3.6-flash) is config ko 400 dete hain, isliye
             # sirf is case me try karo aur 400 aaye to original reply chhodo.
-            if (not text and not tool_calls) or (thoughts > 0 and finish_reason == "MAX_TOKENS"):
+            if (not text.strip() and not tool_calls) or (thoughts > 0 and finish_reason == "MAX_TOKENS"):
                 try:
                     body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
                     resp2 = await http.post(

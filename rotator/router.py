@@ -510,8 +510,9 @@ class Rotator:
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_success(proxy)
                 # Empty reply (reasoning model ne saara budget thinking me
-                # kha liya) → failure treat karke agli key/model try karo.
-                if not result.text and not result.tool_calls:
+                # kha liya, ya sirf whitespace bheja) → failure treat karke
+                # agli key/model try karo.
+                if not result.text.strip() and not result.tool_calls:
                     ring.report_failure(state, resolved_model)
                     last_error = ProviderError(
                         f"{st.cfg.name}/{resolved_model}: empty reply "
