@@ -376,6 +376,15 @@ class Rotator:
                     return st, requested
             if not self.allow_model_routing:
                 return None, ""
+            # Requested model static config list me nahi mila — live/new
+            # model ho sakta hai (dashboard provider API se live dikhata hai).
+            # Usi model ko kisi bhi provider pe pin karo — kabhi bhi silently
+            # doosra model mat do. Provider us model ko serve na kar paye toh
+            # router 404/400 ko failure treat karke agli key/model try karega.
+            for st in self.providers:
+                if st.cfg.keys and st.cfg.models:
+                    return st, requested
+            return None, ""
         if self.default_model:
             for st in self.providers:
                 if self.default_model in st.cfg.models:
@@ -394,6 +403,14 @@ class Rotator:
         max_fallback_attempts: Optional[int] = None,
         tools: Optional[list[dict]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
+        # models ki real power — poora OpenAI surface pass-through
+        top_p: Optional[float] = None,
+        stop: Optional[Union[str, list[str]]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        seed: Optional[int] = None,
+        logit_bias: Optional[dict] = None,
     ) -> ChatResult:
         """
         Main entry: send messages, rotating keys+models+providers on failure.
@@ -402,6 +419,8 @@ class Rotator:
         - `models` = list of models (multi-select), sab rotate honge
         - dono empty = config ke saare configured models rotate
         - `tools` / `tool_choice` = function calling (OpenAI format) pass-through
+        - baaki params (top_p, stop, response_format, seed, ...) = models ki
+          real power — pass-through hota hai, rotate hone ke bawajood.
         """
         attempts = max_fallback_attempts or int(self.settings.get("max_fallback_attempts", 16))
         last_error: Optional[Exception] = None
@@ -500,6 +519,13 @@ class Rotator:
                     api_key=state.key,
                     tools=tools,
                     tool_choice=tool_choice,
+                    top_p=top_p,
+                    stop=stop,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    response_format=response_format,
+                    seed=seed,
+                    logit_bias=logit_bias,
                 )
                 ring.report_success(state, resolved_model)
                 ring.record_used(state)

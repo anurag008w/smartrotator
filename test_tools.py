@@ -121,7 +121,7 @@ def test_full_passthrough_through_app():
             self.last_messages = None
 
         async def chat(self, messages, model, *, max_tokens=4096, temperature=0.7,
-                       proxy=None, api_key=None, tools=None, tool_choice=None):
+                       proxy=None, api_key=None, tools=None, tool_choice=None, **kwargs):
             self.last_tools = tools
             self.last_messages = messages
             return ChatResult(

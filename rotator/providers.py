@@ -110,6 +110,13 @@ class Provider:
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[Union[str, list[str]]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        seed: Optional[int] = None,
+        logit_bias: Optional[dict] = None,
     ) -> ChatResult:
         raise NotImplementedError
 
@@ -213,6 +220,13 @@ class OpenAICompatibleProvider(Provider):
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[Union[str, list[str]]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        seed: Optional[int] = None,
+        logit_bias: Optional[dict] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError(f"{self.name}: no api key provided", retryable=False)
@@ -224,6 +238,22 @@ class OpenAICompatibleProvider(Provider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        # models ki real power — optional params sirf tab bhejo jab diye hon,
+        # taaki platforms jo inhe support nahi karte unpe bhi kaam kare
+        if top_p is not None:
+            payload["top_p"] = top_p
+        if stop is not None:
+            payload["stop"] = stop
+        if presence_penalty is not None:
+            payload["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            payload["frequency_penalty"] = frequency_penalty
+        if response_format is not None:
+            payload["response_format"] = response_format
+        if seed is not None:
+            payload["seed"] = seed
+        if logit_bias:
+            payload["logit_bias"] = logit_bias
         if tools:
             payload["tools"] = tools
         if tool_choice:
@@ -347,6 +377,13 @@ class GeminiProvider(Provider):
         api_key: Optional[str] = None,
         tools: Optional[list[dict]] = None,
         tool_choice: Optional[Union[str, dict]] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[Union[str, list[str]]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        response_format: Optional[dict] = None,
+        seed: Optional[int] = None,
+        logit_bias: Optional[dict] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError("gemini: no api key provided", retryable=False)
@@ -359,6 +396,14 @@ class GeminiProvider(Provider):
             "maxOutputTokens": max_tokens,
             "temperature": temperature,
         }
+        # Gemini mapping — models ki real power (jo params Gemini support karta hai)
+        if top_p is not None:
+            body["generationConfig"]["topP"] = top_p
+        if stop is not None:
+            stops = [stop] if isinstance(stop, str) else stop
+            body["generationConfig"]["stopSequences"] = stops
+        if response_format and str(response_format.get("type")) == "json_object":
+            body["generationConfig"]["responseMimeType"] = "application/json"
         if tools:
             body["tools"] = self._to_gemini_tools(tools)
         # Gemini me tool_choice ka native equivalent nahi hai —

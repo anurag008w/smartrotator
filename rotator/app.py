@@ -210,6 +210,14 @@ class ChatCompletionRequest(BaseModel):
     models: Optional[list[str]] = None  # UI multi-select: rotation inhi models se
     tools: Optional[list[dict]] = None  # function calling (OpenAI format)
     tool_choice: Optional[Union[str, dict]] = None
+    # --- models ki real power: poora OpenAI-compatible surface pass-through ---
+    top_p: Optional[float] = None
+    stop: Optional[Union[str, list[str]]] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    response_format: Optional[dict] = None  # {"type": "json_object"} JSON mode
+    seed: Optional[int] = None
+    logit_bias: Optional[dict] = None
 
 
 class RegisterRequest(BaseModel):
@@ -993,6 +1001,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             temperature=req.temperature,
             tools=req.tools,
             tool_choice=req.tool_choice,
+            top_p=req.top_p,
+            stop=req.stop,
+            presence_penalty=req.presence_penalty,
+            frequency_penalty=req.frequency_penalty,
+            response_format=req.response_format,
+            seed=req.seed,
+            logit_bias=req.logit_bias,
         )
     except RateLimitError as exc:
         # provider rate-limit — user ko raw message NAHI dikhate

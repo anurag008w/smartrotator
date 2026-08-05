@@ -31,7 +31,7 @@ class FakeProvider:
         self.models = models
 
     async def chat(self, messages, model, *, max_tokens=4096, temperature=0.7,
-                   proxy=None, api_key=None, tools=None, tool_choice=None):
+                   proxy=None, api_key=None, tools=None, tool_choice=None, **kwargs):
         CALLS.append((self.name, model, api_key[:12]))
         return ChatResult(
             text="ok",
