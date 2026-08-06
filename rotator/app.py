@@ -341,6 +341,12 @@ class ChatCompletionRequest(BaseModel):
     logit_bias: Optional[dict] = None
 
 
+class EmbeddingsRequest(BaseModel):
+    model: str = "gemini-embedding-001"
+    input: Union[str, list[str]] = Field(..., min_length=1)
+    encoding_format: str = "float"  # float | base64 (base64 abhi support nahi)
+
+
 class RegisterRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=64)
     password: str = Field(..., min_length=6, max_length=128)
@@ -444,19 +450,14 @@ async def health(request: Request):
 @app.get("/v1/models")
 async def list_models(request: Request):
     rotator: Rotator = request.app.state.rotator
-    # live models (cache me jo fresh hai) bhi merge karo — mobile app jaisa
-    live = _live_models_for_list(request)
+    # SIRF selected/configured models — live merge NAHI hota ab.
+    # Dashboard "Exposed Models" tab se admin select karta hai ki /v1/models
+    # me kaun se models dikhen (provider_models → apply_managed se cfg.models
+    # override ho jata hai). External apps ke liye exactly wahi dikhega.
     data = [
         {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
         for m in rotator.models()
     ]
-    # live models jo configured list me nahi — unhe bhi dikhao (tag: live)
-    seen = {m["id"] for m in data}
-    for m in live:
-        if m["id"] not in seen:
-            data.append(
-                {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": "live"}
-            )
     return {"object": "list", "data": data, "default_model": rotator.default_model}
 
 
@@ -1279,6 +1280,88 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     )
 
 
+@app.post("/v1/embeddings")
+async def embeddings(req: EmbeddingsRequest, request: Request):
+    """OpenAI-compatible embeddings — Gemini text-embedding models ke through.
+
+    Body: {"model": "text-embedding-004", "input": "text" | ["t1","t2"]}
+    Auth + quota: /v1/chat/completions jaisa hi (Bearer JWT ya sk- key).
+    """
+    rotator: Rotator = request.app.state.rotator
+    settings = _auth_settings()
+
+    # --- auth + quota (sirf jab auth enabled ho) ---
+    user = None
+    if settings["enabled"]:
+        user = await _authenticate(request, settings)
+        if user is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Missing/invalid token. Login karo ya apni sk- API key bhejo.",
+            )
+        quota_ok = await _reserve_quota(user)
+        if not quota_ok:
+            raise HTTPException(
+                status_code=429,
+                detail="Aapka daily quota khatam ho gaya. Kal reset hoga.",
+            )
+
+    # input normalize — OpenAI string ya list dono accept karta hai
+    texts = [req.input] if isinstance(req.input, str) else list(req.input)
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    if not texts:
+        if user:
+            await _refund_quota(user)
+        raise HTTPException(status_code=400, detail="input empty hai")
+
+    # Gemini provider + keys chahiye (sirf Gemini embeddings support karta hai)
+    gemini_st = next(
+        (st for st in rotator.providers if st.cfg.ptype == "gemini" and st.cfg.keys),
+        None,
+    )
+    if gemini_st is None:
+        if user:
+            await _refund_quota(user)
+        logger.error("embeddings: koi Gemini provider/keys configured nahi")
+        raise HTTPException(
+            status_code=503,
+            detail="Embeddings ke liye koi Gemini provider configured nahi hai.",
+        )
+
+    gemini_provider = gemini_st.provider
+    keys = gemini_st.ring.keys_as_list()
+
+    # keys pe chota failover: pehli available key try karo, fail pe agli.
+    # (pura rotation loop router jaisa banana overkill — embeddings rare hai)
+    last_err: Optional[Exception] = None
+    for idx, key in enumerate(keys[:3]):
+        try:
+            proxy = None
+            if rotator.proxy_pool is not None:
+                proxy = rotator.proxy_pool.next()
+            result = await gemini_provider.embeddings(
+                texts, model=req.model, proxy=proxy, api_key=key
+            )
+            if user:
+                tokens = result.get("usage", {}).get("total_tokens", 0) or 0
+                await _record_tokens(user, int(tokens))
+            return JSONResponse(content=result)
+        except (RateLimitError, ProviderError) as exc:
+            last_err = exc
+            # rate limit / transient — agli key try karo
+            if idx == len(keys[:3]) - 1:
+                break
+            continue
+
+    if user:
+        await _refund_quota(user)
+    logger.error("embeddings: sab keys fail — %s", last_err)
+    raise HTTPException(
+        status_code=503,
+        detail="Embeddings generate karne me problem aayi. Kuch minute baad try karo.",
+    )
+
+
 # --------------------------------------------------------------------------
 # Auth + quota helpers
 # --------------------------------------------------------------------------
@@ -1515,6 +1598,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="tab" onclick="showView('usage'); loadMe();">📊 Usage</div>
       <div class="tab" onclick="showView('settings')">⚙️ Settings</div>
       <div class="tab" id="modelsTab" style="display:none" onclick="showView('models'); loadModelsAdmin();">🧠 Models</div>
+      <div class="tab" id="exposedTab" style="display:none" onclick="showView('exposed'); loadExposed();">🎚 Exposed</div>
       <div class="tab" id="adminTab" style="display:none" onclick="showView('admin'); loadAdmin();">🛡 Admin</div>
     </div>
 
@@ -1641,6 +1725,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button class="btn" onclick="saveModels()">💾 Save Models Config</button>
       </div>
     </div>
+
+    <!-- EXPOSED MODELS VIEW -->
+    <div class="view" id="view-exposed">
+      <div class="card">
+        <h3 style="margin-bottom:4px">Exposed Models</h3>
+        <div class="muted" style="margin-bottom:10px">Har provider ke saare models (live API se fetch) me se select karo — <b>/v1/models</b> me external apps ko SIRF checked wale dikhenge. Routing bhi sirf inhi models me hogi. 🔄 Refresh se naye models aa jate hain. 💡</div>
+        <div class="err" id="exposed-err"></div>
+        <div class="ok" id="exposed-ok"></div>
+        <div style="margin:10px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <button class="btn sec" onclick="refreshExposedLive()">🔄 Refresh Live Models</button>
+          <button class="btn" onclick="saveExposed()">💾 Save Exposed Models</button>
+          <span class="muted" id="exposed-status"></span>
+        </div>
+        <div id="exposed-list"><span class="muted">Loading…</span></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1672,6 +1772,7 @@ function showMain(user, isSuperAdmin) {
   // (env wala YA promote hua). Users & Quotas (Admin) → SIRF env wala.
   const isAnyAdmin = isSuperAdmin || user.role === 'admin';
   document.getElementById('modelsTab').style.display = isAnyAdmin ? '' : 'none';
+  document.getElementById('exposedTab').style.display = isAnyAdmin ? '' : 'none';
   document.getElementById('adminTab').style.display = isSuperAdmin ? '' : 'none';
 }
 function authTab(which) {
@@ -2154,6 +2255,105 @@ async function saveModels() {
     okEl.textContent = '✅ ' + (data.message || 'Saved');
     setTimeout(() => okEl.textContent = '', 3000);
   }
+}
+
+// ---------- exposed models (per-provider selection tab) ----------
+let exposedData = null;   // /admin/models response
+let exposedSel = {};      // provider -> [selected models]
+
+async function loadExposed() {
+  const { res, data } = await api('/admin/models');
+  if (!res.ok) { document.getElementById('exposed-err').textContent = data.detail || 'Failed'; return; }
+  exposedData = data;
+  // selection init: managed.provider_models (saved selection); agar kisi
+  // provider ke liye kuch save nahi → configured_models default.
+  const pm = (data.managed || {}).provider_models || {};
+  exposedSel = {};
+  (data.providers || []).forEach(p => {
+    exposedSel[p.name] = Array.isArray(pm[p.name]) ? pm[p.name].slice() : (p.configured_models || []).slice();
+  });
+  renderExposed();
+}
+
+// provider ke saare possible models: LIVE (API se) + catalog + configured
+function exposedModelOptions(providerName) {
+  const p = (exposedData.providers || []).find(x => x.name === providerName);
+  const live = (p && p.live_models) || [];
+  const cat = (exposedData.catalog && exposedData.catalog[providerName]) || [];
+  const conf = (p && p.configured_models) || [];
+  return Array.from(new Set(live.concat(cat).concat(conf))).sort();
+}
+
+function renderExposed() {
+  const box = document.getElementById('exposed-list');
+  box.innerHTML = '';
+  let shown = 0;
+  (exposedData.providers || []).forEach(p => {
+    const opts = exposedModelOptions(p.name);
+    if (!opts.length) return; // models nahi mile — skip (bina keys/config wale)
+    shown++;
+    const sel = exposedSel[p.name] || [];
+    const card = document.createElement('div');
+    card.style.cssText = 'background:var(--panel2);border:1px solid var(--border);border-radius:12px;padding:14px;margin-bottom:12px';
+    const chips = opts.map(m => {
+      const on = sel.includes(m);
+      return `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer"><input type="checkbox" ${on ? 'checked' : ''} onchange="toggleExposed('${esc(p.name)}','${esc(m)}',this.checked)">${esc(m)}</label>`;
+    }).join('');
+    card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px">
+        <div><strong>${esc(p.name)}</strong> <span class="tag">${esc(p.type)}</span> <span class="tag">${p.key_count || 0} keys</span></div>
+        <div style="display:flex;gap:6px;align-items:center"><span class="tag" style="color:var(--accent2)">${sel.length}/${opts.length}</span>
+          <button class="btn sec" style="padding:4px 10px;font-size:12px" onclick="exposedAll('${esc(p.name)}', true)">All</button>
+          <button class="btn sec" style="padding:4px 10px;font-size:12px" onclick="exposedAll('${esc(p.name)}', false)">None</button>
+        </div>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">${chips}</div>`;
+    box.appendChild(card);
+  });
+  if (!shown) box.innerHTML = '<div class="muted">Koi provider configured nahi (ya models fetch nahi hue) — config.yaml + keys check karo, phir 🔄 Refresh dabao.</div>';
+}
+
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+function toggleExposed(provider, model, on) {
+  const sel = exposedSel[provider] || (exposedSel[provider] = []);
+  if (on) { if (!sel.includes(model)) sel.push(model); }
+  else exposedSel[provider] = sel.filter(m => m !== model);
+  renderExposed();
+}
+
+function exposedAll(provider, on) {
+  exposedSel[provider] = on ? exposedModelOptions(provider) : [];
+  renderExposed();
+}
+
+async function saveExposed() {
+  const st = document.getElementById('exposed-status');
+  const btn = [...document.querySelectorAll('button')].find(b => b.textContent.includes('Save Exposed'));
+  if (btn) btn.disabled = true;
+  if (st) st.textContent = '⏳ saving…';
+  const managed = exposedData.managed || {};
+  const payload = {
+    provider_models: exposedSel,
+    provider_order: managed.provider_order || [],
+    groups: managed.groups || [],
+  };
+  const { res, data } = await api('/admin/models', { method: 'PUT', body: JSON.stringify(payload) });
+  if (btn) btn.disabled = false;
+  if (!res.ok) { document.getElementById('exposed-err').textContent = data.detail || 'Save failed'; if (st) st.textContent = ''; return; }
+  document.getElementById('exposed-err').textContent = '';
+  if (st) st.textContent = '✅ ' + (data.message || 'Saved');
+  await loadExposed();   // configured_models ab naye selection ke hisaab se
+  loadModels();          // chat tab ka model list bhi update
+}
+
+async function refreshExposedLive() {
+  const st = document.getElementById('exposed-status');
+  if (st) st.textContent = '⏳ refreshing…';
+  const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
+  if (!res.ok) { document.getElementById('exposed-err').textContent = data.detail || 'Refresh failed'; if (st) st.textContent = ''; return; }
+  const lines = (data.results || []).map(r => `${r.name}: ${r.count}${r.error ? ' (❌)' : ''}`).join(' · ');
+  if (st) st.textContent = '✅ ' + lines;
+  await loadExposed();
 }
 
 // ---------- tabs ----------

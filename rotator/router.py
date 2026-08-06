@@ -305,11 +305,15 @@ class Rotator:
             self.providers.sort(key=lambda st: index.get(st.cfg.name, 10**9))
 
         # 3. active model override (dashboard se select kiye models)
+        # NOTE: key exists hone pe empty list = "kuch nahi dikhao" (user ne
+        # saare unchecked kiye hain). Isliye `in overrides` check karo, na ki
+        # truthiness — warna empty selection config.yaml ke models expose kar
+        # deta tha (Exposed Models tab ka None = sab visible bug).
         overrides = managed.get("provider_models") or {}
         rebuilt: list[ProviderState] = []
         for st in self.providers:
-            models = [m for m in (overrides.get(st.cfg.name) or []) if m]
-            if models:
+            if st.cfg.name in overrides:
+                models = [m for m in (overrides.get(st.cfg.name) or []) if m]
                 pcfg = ProviderConfig(
                     name=st.cfg.name,
                     ptype=st.cfg.ptype,

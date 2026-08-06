@@ -58,6 +58,21 @@ def is_blank_text(text: str) -> bool:
     return not clean_text(text)
 
 
+def is_web_search_tool(tool) -> bool:
+    """Kya ye tool web search hai? OpenAI-style `{"type": "web_search"}` ya
+    `{"type": "function", "function": {"name": "web_search"}}` dono handle karo."""
+    if not isinstance(tool, dict):
+        return False
+    if str(tool.get("type", "")).lower() == "web_search":
+        return True
+    fn = tool.get("function") or {}
+    if isinstance(fn, dict) and str(fn.get("name", "")).lower() in (
+        "web_search", "websearch", "search_internet", "google_search",
+    ):
+        return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # Data models
 # --------------------------------------------------------------------------
@@ -295,7 +310,12 @@ class OpenAICompatibleProvider(Provider):
         if logit_bias:
             payload["logit_bias"] = logit_bias
         if tools:
-            payload["tools"] = tools
+            # web_search tools OpenAI-compat platforms pe support nahi hote
+            # (Groq/OpenRouter/zen unknown type pe 400 dete hain) — filter karo.
+            # Sirf function tools aage bhejo.
+            function_tools = [t for t in tools if not is_web_search_tool(t)]
+            if function_tools:
+                payload["tools"] = function_tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
         headers = {
@@ -457,10 +477,25 @@ class GeminiProvider(Provider):
         if response_format and str(response_format.get("type")) == "json_object":
             body["generationConfig"]["responseMimeType"] = "application/json"
         if tools:
-            body["tools"] = self._to_gemini_tools(tools)
+            # Web search tools → Google Search grounding (Gemini native).
+            # Function declarations me SIRF function tools jaate hain.
+            function_tools = [t for t in tools if not is_web_search_tool(t)]
+            search_tools = [t for t in tools if is_web_search_tool(t)]
+            body["tools"] = []
+            if search_tools:
+                body["tools"].append({"google_search": {}})
+            if function_tools:
+                body["tools"].extend(self._to_gemini_tools(function_tools))
+            if not body["tools"]:
+                body.pop("tools", None)
+            elif search_tools and not function_tools and not tool_choice:
+                # sirf search grounding — koi functionConfig mat bhejo
+                tool_choice = None
         # Gemini me tool_choice ka native equivalent nahi hai —
-        # "any" chahiye toh function_calling_config use hota hai
-        if tool_choice and tools:
+        # "any" chahiye toh function_calling_config use hota hai.
+        # SIRF function tools hote tab bhejo (search grounding ke saath
+        # mode=ANY function bhi force kar dega, search ko daba kar).
+        if tool_choice and any(not is_web_search_tool(t) for t in (tools or [])):
             body["toolConfig"] = {
                 "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": []}
             }
@@ -527,6 +562,97 @@ class GeminiProvider(Provider):
         finally:
             if client is not None:
                 await client.aclose()
+
+    # ------------------------------------------------------------------
+    # Embeddings — OpenAI-compatible text → vector (Gemini batchEmbedContents)
+    # ------------------------------------------------------------------
+    async def embeddings(
+        self,
+        inputs: list[str],
+        model: str = "gemini-embedding-001",
+        *,
+        proxy: Optional[str] = None,
+        api_key: Optional[str] = None,
+        chunk_size: int = 100,
+    ) -> dict:
+        """Texts ka vector banao.
+
+        Gemini ke batchEmbedContents ko OpenAI-compatible response me wrap
+        karta hai:
+          {"object":"list","data":[{"object":"embedding","embedding":[...],"index":i}],
+           "model":..., "usage": {...}}
+        Gemini batch limit ~100 requests/call — chunk me bhejo.
+        """
+        if not api_key:
+            raise AuthError("gemini: no api key provided", retryable=False)
+        if not inputs:
+            raise ProviderError("gemini: embeddings empty input", status_code=400, retryable=False)
+
+        gemini_model = self._map_embedding_model(model)
+        url = f"{self.base_url}/models/{gemini_model}:batchEmbedContents"
+        headers = {"Content-Type": "application/json"}
+        params = {"key": api_key}
+        client = self._proxy_client(proxy)
+        all_embeddings: list[list[float]] = []
+        try:
+            http = client or self._client
+            for start in range(0, len(inputs), chunk_size):
+                chunk = inputs[start:start + chunk_size]
+                body = {
+                    "requests": [
+                        {"model": f"models/{gemini_model}", "content": {"parts": [{"text": t}]}}
+                        for t in chunk
+                    ]
+                }
+                resp = await http.post(url, headers=headers, params=params, json=body)
+                resp.raise_for_status()
+                data = self._parse_json_response(resp, self.name)
+                self._check_error_body(data, self.name)
+                for e in data.get("embeddings", []):
+                    all_embeddings.append(e.get("values") or [])
+        except httpx.HTTPStatusError as exc:
+            raise self._map_error(exc, self.name) from exc
+        except httpx.HTTPError as exc:
+            raise self._map_network(exc, self.name) from exc
+        finally:
+            if client is not None:
+                await client.aclose()
+
+        # token estimate: ~4 chars/token (Gemini doesn't return usage for
+        # batchEmbedContents — ek sane estimate daal do)
+        est = sum(max(1, len(t) // 4) for t in inputs)
+        return {
+            "object": "list",
+            "data": [
+                {"object": "embedding", "embedding": vec, "index": i}
+                for i, vec in enumerate(all_embeddings)
+            ],
+            "model": model,
+            "usage": {"prompt_tokens": est, "total_tokens": est},
+        }
+
+    @staticmethod
+    def _map_embedding_model(model: str) -> str:
+        """OpenAI embedding model names → Gemini native names.
+
+        Gemini ke available embedding models (ListModels se confirmed):
+          gemini-embedding-001   (3072-dim, modern keys pe stable)
+          gemini-embedding-2     / gemini-embedding-2-preview
+          text-embedding-004 / 001 / text-multilingual-embedding-002
+            (purane free models — kuch keys pe ab available nahi)
+        Inhe passthrough karo; baaki (text-embedding-3-small, ada-002,
+        unknown...) → default gemini-embedding-001.
+        """
+        native = {
+            "text-embedding-004",
+            "text-embedding-001",
+            "text-multilingual-embedding-002",
+            "gemini-embedding-001",
+            "gemini-embedding-2",
+            "gemini-embedding-2-preview",
+        }
+        m = (model or "").strip()
+        return m if m in native else "gemini-embedding-001"
 
     @staticmethod
     def _sanitize_gemini_schema(schema):
