@@ -1285,6 +1285,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             detail="AI model ne khaali reply diya (saara token budget thinking me chala gaya). Thodi der baad try karo ya max_tokens badhao.",
         )
 
+    # web search indicator — raw Gemini response se grounding check karo.
+    # Client ko test karne me asaan ho: `"web_search": true` = search hua,
+    # `false` = search tool drop ho gaya (openai-type member) ya koi grounding nahi.
+    gm = (result.raw or {}).get("candidates", [{}])[0].get("groundingMetadata") or {}
+    ws_used = bool(
+        gm.get("groundingChunks") or gm.get("webSearchQueries") or gm.get("searchEntryPoint")
+    )
+    ws_queries = gm.get("webSearchQueries") or []
+
     return JSONResponse(
         content={
             "id": "chatcmpl-rotator",
@@ -1293,6 +1302,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             "model": result.model,
             "provider": result.provider,
             "key": result.key_label,
+            "web_search": ws_used,
+            **({"search_queries": ws_queries} if ws_queries else {}),
             "choices": [
                 {
                     "index": 0,
