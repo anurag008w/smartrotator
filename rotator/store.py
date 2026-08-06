@@ -70,6 +70,7 @@ class User:
     api_key: str
     role: str = "user"
     daily_limit: int = 30
+    monthly_limit: int = 1000
     created_at: str = ""
 
     @property
@@ -94,6 +95,11 @@ def _now_utc() -> str:
 
 def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def month_utc() -> str:
+    """Current month key — usage.json me month-wise check ke liye ("YYYY-MM")."""
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 def _days_ago(n: int) -> str:
@@ -277,6 +283,7 @@ def _user_from_dict(u: dict) -> User:
         api_key=u.get("api_key", ""),
         role=u.get("role", "user"),
         daily_limit=int(u.get("daily_limit", 30)),
+        monthly_limit=int(u.get("monthly_limit", 1000)),
         created_at=u.get("created_at", ""),
     )
 
@@ -312,6 +319,7 @@ async def create_user(
     salt: str,
     api_key: str,
     daily_limit: int = 30,
+    monthly_limit: int = 1000,
     role: str = "user",
 ) -> User:
     global _next_id
@@ -326,6 +334,7 @@ async def create_user(
             "api_key": api_key,
             "role": role,
             "daily_limit": daily_limit,
+            "monthly_limit": monthly_limit,
             "created_at": _now_utc(),
         }
         _users[uid] = u
@@ -349,6 +358,24 @@ async def set_daily_limit(user_id: int, daily_limit: int) -> Optional[User]:
         if not u:
             return None
         u["daily_limit"] = daily_limit
+        _persist_users_locked()
+        return _user_from_dict(u)
+
+
+async def set_limits(
+    user_id: int,
+    daily_limit: Optional[int] = None,
+    monthly_limit: Optional[int] = None,
+) -> Optional[User]:
+    """Daily + monthly limit set karo (jo diya gaya wahi update hota hai)."""
+    async with _lock:
+        u = _users.get(int(user_id))
+        if not u:
+            return None
+        if daily_limit is not None:
+            u["daily_limit"] = int(daily_limit)
+        if monthly_limit is not None:
+            u["monthly_limit"] = int(monthly_limit)
         _persist_users_locked()
         return _user_from_dict(u)
 
@@ -443,6 +470,62 @@ async def get_usage_row(user_id: int, day: str) -> UsageRow:
         return UsageRow(user_id=int(user_id), day=day, requests=int(c["requests"]), tokens=int(c["tokens"]))
 
 
+async def get_usage_month(user_id: int, month: str) -> UsageRow:
+    """Poore month ka usage sum karo — "YYYY-MM" prefix wale saare days."""
+    async with _lock:
+        total_req = 0
+        total_tok = 0
+        for day, cell in _usage.get(int(user_id), {}).items():
+            if day.startswith(month):
+                total_req += int(cell["requests"])
+                total_tok += int(cell["tokens"])
+        return UsageRow(user_id=int(user_id), day=month, requests=total_req, tokens=total_tok)
+
+
+async def get_usage_month_days(user_id: int, month: str) -> list[UsageRow]:
+    """Month ke har din ka usage — bar chart ke liye (sirf jinke data hai)."""
+    async with _lock:
+        rows = []
+        for day in sorted(_usage.get(int(user_id), {}).keys()):
+            if day.startswith(month):
+                c = _usage[int(user_id)][day]
+                rows.append(UsageRow(user_id=int(user_id), day=day, requests=int(c["requests"]), tokens=int(c["tokens"])))
+        return rows
+
+
+async def get_monthly_totals(user_id: int, months: int = 6) -> list[UsageRow]:
+    """Last N months ke totals (month → requests/tokens) — month-over-month graph."""
+    async with _lock:
+        now = datetime.now(timezone.utc)
+        prefixes = []
+        y, m = now.year, now.month
+        for _ in range(months):
+            prefixes.append(f"{y:04d}-{m:02d}")
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        prefixes = set(prefixes)
+        agg: dict[str, list[int]] = {}
+        for day, cell in _usage.get(int(user_id), {}).items():
+            prefix = day[:7]
+            if prefix in prefixes:
+                agg.setdefault(prefix, [0, 0])
+                agg[prefix][0] += int(cell["requests"])
+                agg[prefix][1] += int(cell["tokens"])
+        rows = []
+        y, m = now.year, now.month
+        for _ in range(months):
+            key = f"{y:04d}-{m:02d}"
+            a = agg.get(key, [0, 0])
+            rows.append(UsageRow(user_id=int(user_id), day=key, requests=a[0], tokens=a[1]))
+            m -= 1
+            if m == 0:
+                m = 12
+                y -= 1
+        return rows
+
+
 async def get_usage_between(user_id: int, days: int = 7) -> list[UsageRow]:
     async with _lock:
         start = _days_ago(days)
@@ -455,7 +538,7 @@ async def get_usage_between(user_id: int, days: int = 7) -> list[UsageRow]:
 
 
 async def reserve_quota(user_id: int, day: str, limit: int) -> bool:
-    """Request reserve — quota bacha hai toh True (aur count +1)."""
+    """Request reserve — daily quota bacha hai toh True (aur count +1)."""
     async with _lock:
         c = _usage_cell(user_id, day)
         if int(c["requests"]) >= int(limit):
@@ -463,6 +546,41 @@ async def reserve_quota(user_id: int, day: str, limit: int) -> bool:
         c["requests"] = int(c["requests"]) + 1
         _persist_usage_locked()
         return True
+
+
+async def reserve_quota_with_monthly(
+    user_id: int,
+    day: str,
+    month: str,
+    daily_limit: int,
+    monthly_limit: int,
+) -> bool:
+    """Daily + monthly dono quota check karke reserve karo (atomic).
+
+    Admin unlimited hai — unke liye reserve_unlimited use karo.
+    """
+    async with _lock:
+        c = _usage_cell(user_id, day)
+        # monthly total: is month ke saare days (aaj ka cell included)
+        month_total = 0
+        for d, cell in _usage.get(int(user_id), {}).items():
+            if d.startswith(month):
+                month_total += int(cell["requests"])
+        if int(monthly_limit) > 0 and month_total >= int(monthly_limit):
+            return False
+        if int(c["requests"]) >= int(daily_limit):
+            return False
+        c["requests"] = int(c["requests"]) + 1
+        _persist_usage_locked()
+        return True
+
+
+async def reserve_unlimited(user_id: int, day: str) -> None:
+    """Admin ke liye — koi limit check nahi, par usage TRACK hota hai."""
+    async with _lock:
+        c = _usage_cell(user_id, day)
+        c["requests"] = int(c["requests"]) + 1
+        _persist_usage_locked()
 
 
 async def set_usage(user_id: int, day: str, requests: int, tokens: int = 0) -> None:

@@ -254,7 +254,8 @@ def _auth_settings() -> dict:
         secret = _load_or_create_jwt_secret()
     return {
         "enabled": bool(cfg.get("enabled", True)),
-        "default_daily_limit": int(cfg.get("default_daily_limit", 50)),
+        "default_daily_limit": int(cfg.get("default_daily_limit", 30)),
+        "default_monthly_limit": int(cfg.get("default_monthly_limit", 1000)),
         "jwt_secret": secret,
         "jwt_hours": int(cfg.get("jwt_hours", 24)),
         "admin_usernames": _admin_usernames(cfg),
@@ -367,7 +368,8 @@ class SyncStateRequest(BaseModel):
 
 
 class SetLimitRequest(BaseModel):
-    daily_limit: int = Field(..., ge=1, le=100000)
+    daily_limit: Optional[int] = Field(None, ge=1, le=1000000)
+    monthly_limit: Optional[int] = Field(None, ge=1, le=10000000)
 
 
 class ChangePasswordRequest(BaseModel):
@@ -523,6 +525,7 @@ async def register(req: RegisterRequest, request: Request):
         salt=salt,
         api_key=generate_api_key(),
         daily_limit=settings["default_daily_limit"],
+        monthly_limit=settings["default_monthly_limit"],
         role=role,
     )
 
@@ -574,13 +577,29 @@ async def auth_me(request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
     today = database.today_utc()
+    month = database.month_utc()
     row = await database.get_usage_row(user.id, today)
+    month_row = await database.get_usage_month(user.id, month)
+    month_days = await database.get_usage_month_days(user.id, month)
+    monthly_totals = await database.get_monthly_totals(user.id, 6)
     history = await database.get_usage_between(user.id, 7)
     return {
         "user": _user_public(user),
         "is_super_admin": _is_super_admin(user, settings),
         "api_key": user.api_key,
+        "unlimited": user.is_admin,
+        "limits": {
+            "daily_limit": user.daily_limit,
+            "monthly_limit": user.monthly_limit,
+        },
         "today": {"day": today, "requests": row.requests, "tokens": row.tokens},
+        "month": {"month": month, "requests": month_row.requests, "tokens": month_row.tokens},
+        "month_days": [
+            {"day": d.day, "requests": d.requests, "tokens": d.tokens} for d in month_days
+        ],
+        "monthly_totals": [
+            {"month": t.day, "requests": t.requests, "tokens": t.tokens} for t in monthly_totals
+        ],
         "history": [
             {"day": h.day, "requests": h.requests, "tokens": h.tokens} for h in history
         ],
@@ -696,9 +715,11 @@ async def admin_users(request: Request):
 
     users = await database.list_users()
     today = database.today_utc()
+    month = database.month_utc()
     out = []
     for u in users:
         row = await database.get_usage_row(u.id, today)
+        month_row = await database.get_usage_month(u.id, month)
         out.append(
             {
                 "id": u.id,
@@ -706,7 +727,11 @@ async def admin_users(request: Request):
                 "role": u.role,
                 "api_key": u.api_key[:14] + "...",
                 "daily_limit": u.daily_limit,
+                "monthly_limit": u.monthly_limit,
                 "today_requests": row.requests,
+                "today_tokens": row.tokens,
+                "month_requests": month_row.requests,
+                "month_tokens": month_row.tokens,
                 "created_at": u.created_at,
             }
         )
@@ -719,11 +744,20 @@ async def admin_set_limit(user_id: int, req: SetLimitRequest, request: Request):
     user = await _require_user(request, settings)
     if not _is_super_admin(user, settings):
         raise HTTPException(status_code=403, detail="Admin only")
+    if req.daily_limit is None and req.monthly_limit is None:
+        raise HTTPException(status_code=400, detail="daily_limit ya monthly_limit do")
 
-    target = await database.set_daily_limit(user_id, req.daily_limit)
+    target = await database.set_limits(
+        user_id, daily_limit=req.daily_limit, monthly_limit=req.monthly_limit
+    )
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
-    return {"ok": True, "username": target.username, "daily_limit": target.daily_limit}
+    return {
+        "ok": True,
+        "username": target.username,
+        "daily_limit": target.daily_limit,
+        "monthly_limit": target.monthly_limit,
+    }
 
 
 @app.post("/admin/users/{user_id}/role")
@@ -1392,10 +1426,22 @@ async def _require_user(request: Request, settings: dict):
 
 
 async def _reserve_quota(user) -> bool:
-    """Request reserve karo — quota bacha hai toh True. Admin ke liye unlimited."""
+    """Request reserve — quota bacha hai toh True.
+
+    Admin ke liye unlimited (koi check nahi), PAR usage track hota hai —
+    dashboard me admin ka usage bhi dikhta hai (limit me ♾️ symbol).
+    Normal user: daily + monthly dono check hota hai.
+    """
     if user.is_admin:
+        await database.reserve_unlimited(user.id, database.today_utc())
         return True
-    return await database.reserve_quota(user.id, database.today_utc(), user.daily_limit)
+    return await database.reserve_quota_with_monthly(
+        user.id,
+        database.today_utc(),
+        database.month_utc(),
+        user.daily_limit,
+        user.monthly_limit,
+    )
 
 
 async def _refund_quota(user) -> None:
@@ -1413,6 +1459,7 @@ def _user_public(user) -> dict:
         "username": user.username,
         "role": user.role,
         "daily_limit": user.daily_limit,
+        "monthly_limit": user.monthly_limit,
         "created_at": user.created_at,
     }
 
@@ -1654,6 +1701,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="stat"><span>Tokens consumed</span><span id="u-tokens">–</span></div>
           <div class="bar-bg" style="margin-top:14px"><div class="bar" id="u-bar" style="width:0%"></div></div>
           <div class="muted" id="u-remaining" style="margin-top:8px"></div>
+          <h3 style="margin:20px 0 10px">This Month</h3>
+          <div class="stat"><span>Requests used</span><span id="u-mused">–</span></div>
+          <div class="stat"><span>Monthly limit</span><span id="u-mlimit">–</span></div>
+          <div class="stat"><span>Tokens consumed</span><span id="u-mtokens">–</span></div>
+          <h3 style="margin:20px 0 10px">This Month — Daily</h3>
+          <div class="history" id="u-mgraph"></div>
+          <h3 style="margin:20px 0 10px">Last 6 Months</h3>
+          <div class="history" id="u-mtotals"></div>
           <h3 style="margin:20px 0 10px">Last 7 Days</h3>
           <div class="history" id="u-history"></div>
         </div>
@@ -1702,7 +1757,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="card">
         <h3 style="margin-bottom:14px">Users & Quotas</h3>
         <div style="overflow:auto"><table id="admin-table">
-          <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Key</th><th>Today</th><th>Limit</th><th></th></tr></thead>
+          <thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Key</th><th>Today (req · tok)</th><th>This Month (req · tok)</th><th>Daily limit</th><th>Monthly limit</th></tr></thead>
           <tbody></tbody>
         </table></div>
       </div>
@@ -1964,13 +2019,27 @@ document.getElementById('prompt').addEventListener('keydown', e => { if (e.key =
 async function loadMe() {
   const { res, data } = await api('/auth/me');
   if (!res.ok) return;
-  const u = data.user, t = data.today;
+  const u = data.user, t = data.today, m = data.month || {}, lim = data.limits || {};
+  const unlimited = !!data.unlimited;
   document.getElementById('u-used').textContent = t.requests;
-  document.getElementById('u-limit').textContent = u.daily_limit;
-  document.getElementById('u-tokens').textContent = t.tokens.toLocaleString();
-  const pct = Math.min(100, (t.requests / u.daily_limit) * 100);
-  document.getElementById('u-bar').style.width = pct + '%';
-  document.getElementById('u-remaining').textContent = (u.daily_limit - t.requests) + ' requests remaining today';
+  document.getElementById('u-tokens').textContent = (t.tokens || 0).toLocaleString();
+  document.getElementById('u-mused').textContent = m.requests;
+  document.getElementById('u-mtokens').textContent = (m.tokens || 0).toLocaleString();
+  if (unlimited) {
+    // admin/super admin — usage dikhta hai, limit me ♾️ unlimited
+    document.getElementById('u-limit').textContent = '♾️ unlimited';
+    document.getElementById('u-mlimit').textContent = '♾️ unlimited';
+    document.getElementById('u-bar').style.width = '0%';
+    document.getElementById('u-remaining').textContent = 'Admin hai — koi limit nahi! 🎉 (usage track hota rehta hai)';
+  } else {
+    document.getElementById('u-limit').textContent = lim.daily_limit;
+    document.getElementById('u-mlimit').textContent = lim.monthly_limit;
+    const pct = Math.min(100, (t.requests / lim.daily_limit) * 100);
+    document.getElementById('u-bar').style.width = pct + '%';
+    document.getElementById('u-remaining').textContent =
+      (lim.daily_limit - t.requests) + ' requests remaining today · ' +
+      Math.max(0, lim.monthly_limit - (m.requests || 0)) + ' remaining this month';
+  }
   document.getElementById('u-name').textContent = u.username;
   document.getElementById('u-role').textContent = u.role;
   document.getElementById('u-created').textContent = (u.created_at || '').slice(0, 10);
@@ -1985,6 +2054,38 @@ async function loadMe() {
     col.appendChild(bar); col.appendChild(day);
     hist.appendChild(col);
   });
+
+  // This Month — daily bars (month_days already sorted by day)
+  const mg = document.getElementById('u-mgraph');
+  mg.innerHTML = '';
+  const mdays = data.month_days || [];
+  const mmax = Math.max(1, ...mdays.map(d => d.requests));
+  mdays.forEach(d => {
+    const col = document.createElement('div'); col.className = 'hcol';
+    const bar = document.createElement('div'); bar.className = 'hbar';
+    bar.title = 'Day ' + d.day + ': ' + d.requests + ' req · ' + (d.tokens || 0).toLocaleString() + ' tok';
+    bar.style.height = Math.max(2, (d.requests / mmax) * 100) + 'px';
+    const day = document.createElement('div'); day.className = 'hday'; day.textContent = d.day;
+    col.appendChild(bar); col.appendChild(day);
+    mg.appendChild(col);
+  });
+  if (!mdays.length) mg.innerHTML = '<div class="muted">Is month abhi tak koi usage nahi.</div>';
+
+  // Last 6 Months — month totals bars
+  const mt = document.getElementById('u-mtotals');
+  mt.innerHTML = '';
+  const mtot = data.monthly_totals || [];
+  const tmax = Math.max(1, ...mtot.map(mo => mo.requests));
+  mtot.forEach(mo => {
+    const col = document.createElement('div'); col.className = 'hcol';
+    const bar = document.createElement('div'); bar.className = 'hbar';
+    bar.title = mo.month + ': ' + mo.requests + ' req · ' + (mo.tokens || 0).toLocaleString() + ' tok';
+    bar.style.height = Math.max(2, (mo.requests / tmax) * 100) + 'px';
+    const day = document.createElement('div'); day.className = 'hday'; day.textContent = mo.month.slice(2);
+    col.appendChild(bar); col.appendChild(day);
+    mt.appendChild(col);
+  });
+  if (!mtot.length) mt.innerHTML = '<div class="muted">Abhi koi monthly data nahi.</div>';
 }
 
 // ---------- settings ----------
@@ -2042,9 +2143,10 @@ async function loadAdmin() {
         <option value="admin" ${u.role === 'admin' ? 'selected' : ''}>admin</option>
       </select></td>
       <td class="muted">${u.api_key}</td>
-      <td>${u.today_requests}</td>
-      <td>${u.daily_limit}</td>
-      <td><input type="number" value="${u.daily_limit}" min="1" style="width:80px;padding:6px" onchange="setLimit(${u.id}, this.value)"></td>`;
+      <td>${u.today_requests}<span class="muted"> · ${(u.today_tokens || 0).toLocaleString()}</span></td>
+      <td>${u.month_requests}<span class="muted"> · ${(u.month_tokens || 0).toLocaleString()}</span></td>
+      <td><input type="number" value="${u.daily_limit}" min="1" style="width:80px;padding:6px" onchange="setLimit(${u.id}, this.value, 'daily')"></td>
+      <td><input type="number" value="${u.monthly_limit}" min="1" style="width:90px;padding:6px" onchange="setLimit(${u.id}, this.value, 'monthly')"></td>`;
     tb.appendChild(tr);
   });
 }
@@ -2053,8 +2155,9 @@ async function setRole(id, role) {
   if (!res.ok) { alert(data.detail || 'Failed'); loadAdmin(); }
   else setSettingsMsg('✅ ' + data.username + ' → ' + data.role, true);
 }
-async function setLimit(id, value) {
-  const { res, data } = await api('/admin/users/' + id + '/limit', { method: 'POST', body: JSON.stringify({ daily_limit: parseInt(value) }) });
+async function setLimit(id, value, which) {
+  const payload = which === 'monthly' ? { monthly_limit: parseInt(value) } : { daily_limit: parseInt(value) };
+  const { res, data } = await api('/admin/users/' + id + '/limit', { method: 'POST', body: JSON.stringify(payload) });
   if (!res.ok) alert(data.detail || 'Failed');
 }
 
