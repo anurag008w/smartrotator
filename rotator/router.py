@@ -50,6 +50,7 @@ class ProviderConfig:
     base_url: Optional[str] = None
     rpm_limit: int = 0
     rpd_limit: int = 0
+    web_search_passthrough: bool = False
 
 
 class ProviderState:
@@ -163,6 +164,7 @@ class Rotator:
                 base_url=base_url,
                 rpm_limit=int(cfg.get("rpm_limit", 0)),
                 rpd_limit=int(cfg.get("rpd_limit", 0)),
+                web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
             )
         )
 
@@ -207,6 +209,7 @@ class Rotator:
                         base_url=cfg.get("base_url"),
                         rpm_limit=int(cfg.get("rpm_limit", 0)),
                         rpd_limit=int(cfg.get("rpd_limit", 0)),
+                        web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
                     )
                 )
             )
@@ -228,7 +231,13 @@ class Rotator:
             rpm_limit=pcfg.rpm_limit,
             rpd_limit=pcfg.rpd_limit,
         )
-        provider = build_provider(pcfg.name, pcfg.ptype, pcfg.base_url, pcfg.models)
+        provider = build_provider(
+            pcfg.name,
+            pcfg.ptype,
+            pcfg.base_url,
+            pcfg.models,
+            web_search_passthrough=pcfg.web_search_passthrough,
+        )
         return ProviderState(cfg=pcfg, ring=ring, provider=provider)
 
     def _find_provider(self, name: str) -> Optional[ProviderState]:

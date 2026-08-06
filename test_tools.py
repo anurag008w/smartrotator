@@ -185,12 +185,115 @@ def test_full_passthrough_through_app():
         return True
 
 
+class FakeResponse:
+    def __init__(self, data):
+        self._data = data
+        self.status_code = 200
+        self.text = json.dumps(data)
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._data
+
+
+class FakeClient:
+    def __init__(self):
+        self.last_payload = None
+
+    async def post(self, url, headers=None, params=None, json=None, **kwargs):
+        self.last_payload = json
+        return FakeResponse(
+            {"choices": [{"message": {"role": "assistant", "content": "ok"}}], "usage": {}}
+        )
+
+
+def test_openai_web_search_strip_vs_passthrough():
+    """OpenAI-compatible provider: default web_search strip, passthrough flag se keep."""
+    web_tool = {"type": "web_search"}
+    fn_tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "x",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    # default (Groq/OpenRouter/zen): web_search strip hota hai, function tool jaata hai
+    client = FakeClient()
+    provider = OpenAICompatibleProvider("groq", "https://api.groq.com/openai/v1", ["llama-3.3-70b-versatile"])
+    provider._client = client  # type: ignore[assignment]
+    asyncio.run(
+        provider.chat(
+            [ChatMessage(role="user", content="hi")],
+            "llama-3.3-70b-versatile",
+            api_key="k",
+            tools=[web_tool, fn_tool],
+        )
+    )
+    sent_tools = client.last_payload["tools"]
+    assert sent_tools == [fn_tool], sent_tools
+
+    # passthrough: web_search tool upstream tak jaata hai
+    client2 = FakeClient()
+    provider2 = OpenAICompatibleProvider("openai", "https://api.openai.com/v1", ["gpt-5"], web_search_passthrough=True)
+    provider2._client = client2  # type: ignore[assignment]
+    asyncio.run(
+        provider2.chat(
+            [ChatMessage(role="user", content="hi")],
+            "gpt-5",
+            api_key="k",
+            tools=[web_tool, fn_tool],
+        )
+    )
+    sent_tools2 = client2.last_payload["tools"]
+    assert sent_tools2 == [web_tool, fn_tool], sent_tools2
+    return True
+
+
+def test_gemini_web_search_grounding_tool():
+    """Gemini provider: web_search tool -> google_search grounding (current shape)."""
+    from rotator.providers import build_provider
+
+    web_tool = {"type": "web_search"}
+    fn_tool = {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "x",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    client = FakeClient()
+    provider = build_provider("gemini", "gemini", None, ["gemini-2.5-flash"])
+    provider._client = client  # type: ignore[assignment]
+    asyncio.run(
+        provider.chat(
+            [ChatMessage(role="user", content="latest news?")],
+            "gemini-2.5-flash",
+            api_key="k",
+            tools=[web_tool, fn_tool],
+        )
+    )
+    body = client.last_payload
+    # search tool -> google_search grounding; function tool -> functionDeclarations
+    tools = body["tools"]
+    assert {"google_search": {}} in tools, tools
+    assert any("functionDeclarations" in t for t in tools), tools
+    return True
+
+
 def main() -> int:
     tests = [
         ("openai message conversion", test_openai_message_conversion),
         ("gemini tools conversion", test_gemini_tools_conversion),
         ("gemini contents tool roundtrip", test_gemini_contents_with_tool_roundtrip),
         ("gemini tool_calls extraction", test_gemini_tool_calls_extraction),
+        ("openai web_search strip vs passthrough", test_openai_web_search_strip_vs_passthrough),
+        ("gemini web_search grounding tool", test_gemini_web_search_grounding_tool),
         ("full passthrough via app", test_full_passthrough_through_app),
     ]
     passed = 0

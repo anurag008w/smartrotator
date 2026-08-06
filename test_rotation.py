@@ -44,7 +44,7 @@ class FakeProvider:
         pass
 
 
-def fake_build_provider(name, ptype, base_url, models):
+def fake_build_provider(name, ptype, base_url, models, web_search_passthrough=False):
     return FakeProvider(name, models)
 
 

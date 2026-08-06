@@ -258,11 +258,12 @@ class Provider:
 # OpenAI-compatible provider (Groq, OpenRouter, OpenCode Zen, ...)
 # --------------------------------------------------------------------------
 class OpenAICompatibleProvider(Provider):
-    def __init__(self, name: str, base_url: str, models: list[str]):
+    def __init__(self, name: str, base_url: str, models: list[str], web_search_passthrough: bool = False):
         super().__init__(models)
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.endpoint = f"{self.base_url}/chat/completions"
+        self.web_search_passthrough = web_search_passthrough
 
     async def chat(
         self,
@@ -310,10 +311,12 @@ class OpenAICompatibleProvider(Provider):
         if logit_bias:
             payload["logit_bias"] = logit_bias
         if tools:
-            # web_search tools OpenAI-compat platforms pe support nahi hote
-            # (Groq/OpenRouter/zen unknown type pe 400 dete hain) — filter karo.
-            # Sirf function tools aage bhejo.
-            function_tools = [t for t in tools if not is_web_search_tool(t)]
+            # web_search tools most OpenAI-compat platforms pe support nahi hote
+            # (OpenRouter/zen unknown type pe 400 dete hain) — default filter karo.
+            # Providers jinpe native web search hai (OpenAI, Groq compound, custom
+            # gateways) config me `web_search_passthrough: true` laga ke web_search
+            # tool ko upstream tak bhej sakte hain.
+            function_tools = tools if self.web_search_passthrough else [t for t in tools if not is_web_search_tool(t)]
             if function_tools:
                 payload["tools"] = function_tools
         if tool_choice:
@@ -872,13 +875,19 @@ class GeminiProvider(Provider):
 # --------------------------------------------------------------------------
 # Factory
 # --------------------------------------------------------------------------
-def build_provider(name: str, ptype: str, base_url: str | None, models: list[str]) -> Provider:
+def build_provider(
+    name: str,
+    ptype: str,
+    base_url: str | None,
+    models: list[str],
+    web_search_passthrough: bool = False,
+) -> Provider:
     if ptype == "gemini":
         return GeminiProvider(models)
     if ptype == "openai":
         if not base_url:
             raise ValueError(f"provider '{name}': openai type needs base_url")
-        return OpenAICompatibleProvider(name, base_url, models)
+        return OpenAICompatibleProvider(name, base_url, models, web_search_passthrough=web_search_passthrough)
     raise ValueError(f"provider '{name}': unknown type '{ptype}'")
 
 

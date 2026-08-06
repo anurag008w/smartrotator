@@ -28,12 +28,17 @@ providers:
       # - "PASTE_GEMINI_KEY_2"  # multiple keys = zyada quota
 
   # ---------- GROQ (fastest, 1000 RPD per key per model) ----------
+  # NOTE: Groq ke Gemma/Llama models pe native web search NAHI hai.
+  # Web search sirf `groq/compound*` systems pe automatic (bina tools ke)
+  # aur GPT-OSS pe `browser_search` tool se chalta hai.
   - name: groq
     type: openai
     base_url: https://api.groq.com/openai/v1
     models:
       - llama-3.3-70b-versatile
       - meta-llama/llama-4-scout-17b-16e-instruct   # VISION support (20MB images)
+    # web_search_passthrough: true   # sirf tab jab upstream native web_search
+    #                                # support karta ho (OpenAI, Groq compound)
     api_keys:
       - "PASTE_GROQ_KEY_1"
 
