@@ -2137,6 +2137,13 @@ async function loadAdmin() {
   tb.innerHTML = '';
   data.users.forEach(u => {
     const tr = document.createElement('tr');
+    const isAdm = u.role === 'admin';
+    const limitCell = (val) => isAdm
+      ? '<span style="color:var(--accent);font-weight:bold">♾️ unlimited</span>'
+      : `<input type="number" value="${val}" min="1" style="width:80px;padding:6px" onchange="setLimit(${u.id}, this.value, 'daily')">`;
+    const mlimitCell = (val) => isAdm
+      ? '<span style="color:var(--accent);font-weight:bold">♾️ unlimited</span>'
+      : `<input type="number" value="${val}" min="1" style="width:90px;padding:6px" onchange="setLimit(${u.id}, this.value, 'monthly')">`;
     tr.innerHTML = `<td>${u.id}</td><td>${u.username}</td>
       <td><select class="role-sel" data-id="${u.id}" onchange="setRole(${u.id}, this.value)" style="background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:4px 6px;color:var(--text)">
         <option value="user" ${u.role === 'user' ? 'selected' : ''}>user</option>
@@ -2145,15 +2152,16 @@ async function loadAdmin() {
       <td class="muted">${u.api_key}</td>
       <td>${u.today_requests}<span class="muted"> · ${(u.today_tokens || 0).toLocaleString()}</span></td>
       <td>${u.month_requests}<span class="muted"> · ${(u.month_tokens || 0).toLocaleString()}</span></td>
-      <td><input type="number" value="${u.daily_limit}" min="1" style="width:80px;padding:6px" onchange="setLimit(${u.id}, this.value, 'daily')"></td>
-      <td><input type="number" value="${u.monthly_limit}" min="1" style="width:90px;padding:6px" onchange="setLimit(${u.id}, this.value, 'monthly')"></td>`;
+      <td>${limitCell(u.daily_limit)}</td>
+      <td>${mlimitCell(u.monthly_limit)}</td>`;
     tb.appendChild(tr);
   });
 }
 async function setRole(id, role) {
   const { res, data } = await api('/admin/users/' + id + '/role', { method: 'POST', body: JSON.stringify({ role }) });
-  if (!res.ok) { alert(data.detail || 'Failed'); loadAdmin(); }
+  if (!res.ok) { alert(data.detail || 'Failed'); }
   else setSettingsMsg('✅ ' + data.username + ' → ' + data.role, true);
+  loadAdmin();
 }
 async function setLimit(id, value, which) {
   const payload = which === 'monthly' ? { monthly_limit: parseInt(value) } : { daily_limit: parseInt(value) };
