@@ -529,16 +529,90 @@ class GeminiProvider(Provider):
                 await client.aclose()
 
     @staticmethod
+    def _sanitize_gemini_schema(schema):
+        """Pydantic/OpenAI-style JSON Schema → Gemini-compatible schema.
+
+        Gemini function parameters me JSON Schema ka subset support karta hai.
+        Pydantic-generated schemas me `$schema`, `exclusiveMinimum`,
+        `title`, `default` jaise keywords aate hain — Gemini inhe dekhte hi
+        poora request 400 karke reject kar deta hai ("Cannot find field").
+        Isliye unsupported keywords hatao / convert karo (recursively).
+        """
+        if isinstance(schema, list):
+            return [GeminiProvider._sanitize_gemini_schema(s) for s in schema]
+        if not isinstance(schema, dict):
+            return schema
+
+        out: dict = {}
+        for key, value in schema.items():
+            if key == "$schema":
+                continue  # Gemini: Cannot find field
+            if key == "title":
+                continue  # Gemini me support nahi
+            if key == "default":
+                continue  # default bhi reject hota hai
+            if key == "examples":
+                continue
+            if key == "const":
+                continue
+            if key == "multipleOf":
+                continue
+            if key == "additionalProperties":
+                continue  # Gemini function params me support nahi
+            if key in ("pattern", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"):
+                continue  # Gemini support nahi karta (reject hota hai)
+            if key == "exclusiveMinimum":
+                # Gemini sirf minimum/maximum jaanta hai — exclusive ko
+                # approximate karo (integer schemas ke liye +1/-1 exact hai)
+                try:
+                    bound = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if "minimum" not in out:
+                    out["minimum"] = bound + 1
+                continue
+            if key == "exclusiveMaximum":
+                try:
+                    bound = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if "maximum" not in out:
+                    out["maximum"] = bound - 1
+                continue
+            if key in ("anyOf", "oneOf"):
+                # Pydantic nullable = anyOf[{T}, {null}] → base type rakho
+                variants = [v for v in (value or []) if isinstance(v, dict)]
+                non_null = [v for v in variants if v.get("type") != "null"]
+                if len(non_null) == 1:
+                    merged = dict(non_null[0])
+                    out.update(GeminiProvider._sanitize_gemini_schema(merged))
+                    continue
+                # complex union — Gemini support nahi karta, optional banao
+                out["type"] = "string"
+                out["description"] = "union type (simplified)"
+                continue
+            # Kisi bhi nested dict/list me recurse karo — property values,
+            # items, definitions sab schemas hote hain (idempotent sanitizer).
+            if isinstance(value, (dict, list)):
+                out[key] = GeminiProvider._sanitize_gemini_schema(value)
+            else:
+                out[key] = value
+        return out
+
+    @staticmethod
     def _to_gemini_tools(tools: list[dict]) -> list[dict]:
         """OpenAI tools → Gemini functionDeclarations."""
         declarations = []
         for t in tools:
             fn = (t.get("function") or {}) if isinstance(t, dict) else {}
+            parameters = fn.get("parameters") or {"type": "object", "properties": {}}
             declarations.append(
                 {
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
-                    "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+                    # Pydantic schemas ($schema, exclusiveMinimum...) ko
+                    # Gemini-compatible banao — warna 400 + sab providers fail.
+                    "parameters": GeminiProvider._sanitize_gemini_schema(parameters),
                 }
             )
         return [{"functionDeclarations": declarations}]
