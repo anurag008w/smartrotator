@@ -14,7 +14,7 @@ OpenAI-compatible:
   POST /v1/chat/completions   (Authorization: Bearer JWT-login-token ya sk-USER_KEY)
   GET  /v1/models
   GET  /health                (keep-alive)
-  GET  /status                (key/proxy health — public)
+  GET  /status                (key/proxy health — admin only)
   GET  /                      (dashboard SPA)
 
 Auth:
@@ -27,10 +27,12 @@ Admin:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional, Union
 
 import yaml
@@ -58,6 +60,7 @@ from .providers import (
     ProviderError,
     RateLimitError,
     fetch_live_models,
+    is_blank_text,
 )
 from .router import Rotator
 
@@ -152,6 +155,30 @@ app.add_middleware(
 
 
 # --------------------------------------------------------------------------
+# Request logging middleware — production observability
+#
+# Har request log hoti hai: method, path, status, duration, client IP.
+# Sensitive headers (Authorization) kabhi log NAHI hote. Paths me bhi koi
+# query string nahi (tokens URL me aa sakte hain).
+# --------------------------------------------------------------------------
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = (time.perf_counter() - start) * 1000
+    if logger.isEnabledFor(logging.INFO):
+        logger.info(
+            "%s %s -> %d (%.1fms) from %s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            request.client.host if request.client else "-",
+        )
+    return response
+
+
+# --------------------------------------------------------------------------
 # Global exception handler — koi bhi unhandled error raw 500 na dikhe
 #
 # Pehle provider parsing me kuch edge-cases (galat schema, non-JSON body,
@@ -177,11 +204,54 @@ async def unhandled_exception_handler(request: Request, exc: Exception):  # noqa
     )
 
 
+def _load_or_create_jwt_secret() -> str:
+    """JWT secret: env `JWT_SECRET` → hidden file `data/.jwt-secret` (auto-gen).
+
+    Pehle ek PUBLIC default secret source me hardcoded tha — koi bhi JWT forge
+    kar ke kisi bhi user ka token bana sakta tha (CRITICAL). Ab koi fallback
+    secret source me nahi hai: env nahi hai toh random secret generate hota hai
+    aur `data/.jwt-secret` (git-ignored) me persist hota hai.
+    """
+    env_secret = os.environ.get("JWT_SECRET", "").strip()
+    if env_secret:
+        return env_secret
+    path = Path(github_sync.DATA_DIR) / ".jwt-secret"
+    try:
+        if path.exists():
+            val = path.read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import secrets
+
+        generated = secrets.token_urlsafe(48)
+        path.write_text(generated + "\n", encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        logger.warning(
+            "JWT_SECRET env nahi mila — naya secret data/.jwt-secret me generate "
+            "hokar persist ho gaya (restart pe tokens invalid ho jayenge, re-login karna padega)"
+        )
+        return generated
+    except OSError:
+        # data/ writable nahi (read-only filesystem) — in-memory random secret.
+        # Restart pe sab users logout ho jayenge; secure toh hai.
+        logger.error(
+            "JWT secret file write nahi ho paya (data/ writable nahi?) — "
+            "in-memory random secret use ho raha hai, restart pe sab logout"
+        )
+        import secrets
+
+        return secrets.token_urlsafe(48)
+
+
 def _auth_settings() -> dict:
     cfg = _load_config().get("auth", {}) or {}
     secret = os.environ.get(cfg.get("jwt_secret_env", "JWT_SECRET"), cfg.get("jwt_secret", ""))
     if not secret:
-        secret = os.environ.get("JWT_SECRET", "dev-secret-change-me-please-set-env-JWT_SECRET-32bytes")
+        secret = _load_or_create_jwt_secret()
     return {
         "enabled": bool(cfg.get("enabled", True)),
         "default_daily_limit": int(cfg.get("default_daily_limit", 50)),
@@ -199,16 +269,67 @@ def _admin_usernames(cfg: dict) -> set[str]:
 
 
 # --------------------------------------------------------------------------
+# Rate limiting — in-memory sliding window (brute-force protection).
+# Login/register pe unlimited requests = password brute-force + username
+# enumeration. Ye limiter per-boot hai (restart pe reset) — kaafi for
+# self-hosted scale, koi external dependency nahi chahiye.
+# --------------------------------------------------------------------------
+class _RateLimiter:
+    def __init__(self) -> None:
+        self._hits: dict[str, list[float]] = {}  # key -> [monotonic timestamps]
+        self._lock = asyncio.Lock()
+
+    async def hit(self, key: str, limit: int, window: float) -> tuple[bool, int]:
+        """Record a hit. Returns (allowed, retry_after_seconds)."""
+        now = time.monotonic()
+        async with self._lock:
+            bucket = self._hits.setdefault(key, [])
+            cutoff = now - window
+            bucket[:] = [t for t in bucket if t > cutoff]
+            if len(bucket) >= limit:
+                oldest = bucket[0] if bucket else now
+                retry_after = max(1, int(window - (now - oldest)) + 1)
+                return False, retry_after
+            bucket.append(now)
+            return True, 0
+
+    def _reset(self) -> None:  # tests ke liye
+        self._hits.clear()
+
+
+_rate_limiter = _RateLimiter()
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP — Render pe nginx x-forwarded-for set karta hai."""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+async def _enforce_rate_limit(request: Request, bucket: str, limit: int, window: float) -> None:
+    key = f"{bucket}:{_client_ip(request)}"
+    allowed, retry_after = await _rate_limiter.hit(key, limit, window)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Bahut saare requests aa rahe hain — thodi der baad try karo.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+# --------------------------------------------------------------------------
 # Request models
 # --------------------------------------------------------------------------
 class ChatCompletionRequest(BaseModel):
     model: str = ""
-    messages: list[dict] = Field(..., min_length=1)
-    max_tokens: int = 8192
-    temperature: float = 0.7
+    messages: list[dict] = Field(..., min_length=1, max_length=512)
+    max_tokens: int = Field(8192, ge=1, le=262144)
+    temperature: float = Field(0.7, ge=0.0, le=2.0)
     stream: bool = False  # accepted for compatibility; returns non-streamed
-    models: Optional[list[str]] = None  # UI multi-select: rotation inhi models se
-    tools: Optional[list[dict]] = None  # function calling (OpenAI format)
+    models: Optional[list[str]] = Field(None, max_length=50)  # UI multi-select
+    tools: Optional[list[dict]] = Field(None, max_length=50)  # function calling
     tool_choice: Optional[Union[str, dict]] = None
     # --- models ki real power: poora OpenAI-compatible surface pass-through ---
     top_p: Optional[float] = None
@@ -226,8 +347,11 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    # Login pe password policy (min_length) enforce NAHI karte — galat/chhota
+    # password bhi 401 dena chahiye, 422 validation error nahi (policy leak).
+    # Sirf size bound rakhna hai taaki unbounded input na aaye.
+    username: str = Field(..., min_length=1, max_length=64)
+    password: str = Field(..., min_length=1, max_length=128)
 
 
 class SyncStateRequest(BaseModel):
@@ -272,9 +396,9 @@ class SaveModelsRequest(BaseModel):
 class CustomProviderInput(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
     type: str = "openai"          # gemini | openai
-    base_url: str = ""
-    api_keys: list[str] = []
-    models: list[str] = []
+    base_url: str = Field("", max_length=512)
+    api_keys: list[str] = Field([], max_length=100)
+    models: list[str] = Field([], max_length=100)
     enabled: bool = True
 
 
@@ -282,8 +406,39 @@ class CustomProviderInput(BaseModel):
 # Public endpoints
 # --------------------------------------------------------------------------
 @app.get("/health")
-async def health():
-    return {"status": "ok"}
+async def health(request: Request):
+    """Depth check — sirf process alive nahi, data layer bhi check hoti hai.
+
+    Render ka healthCheckPath isi pe hit hota hai. Agar users.json corrupt
+    hai ya rotator load nahi hua, degraded status + 503 dete hain taaki
+    Render restart trigger kare.
+    """
+    checks: list[dict] = []
+    ok = True
+    try:
+        if not hasattr(request.app.state, "rotator") or request.app.state.rotator is None:
+            raise RuntimeError("rotator initialized nahi hai")
+        checks.append({"name": "rotator", "ok": True})
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        checks.append({"name": "rotator", "ok": False, "detail": str(exc)})
+    try:
+        users = await database.count_users()
+        if users < 0:
+            raise RuntimeError("negative user count")
+        checks.append({"name": "store", "ok": True, "users": users})
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        checks.append({"name": "store", "ok": False, "detail": str(exc)})
+    try:
+        _load_config()
+        checks.append({"name": "config", "ok": True})
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        checks.append({"name": "config", "ok": False, "detail": str(exc)})
+    if not ok:
+        return JSONResponse(status_code=503, content={"status": "degraded", "checks": checks})
+    return {"status": "ok", "checks": checks}
 
 
 @app.get("/v1/models")
@@ -318,6 +473,11 @@ async def list_models_raw(request: Request):
 
 @app.get("/status")
 async def status(request: Request):
+    """Provider/key health. Admin-only — key previews + cooldowns expose hoti
+    hain, public nahi hone chahiye (auth off ho to public rahega)."""
+    settings = _auth_settings()
+    if settings["enabled"]:
+        await _require_any_admin(request)
     rotator: Rotator = request.app.state.rotator
     return rotator.status()
 
@@ -326,10 +486,14 @@ async def status(request: Request):
 # Auth endpoints
 # --------------------------------------------------------------------------
 @app.post("/auth/register")
-async def register(req: RegisterRequest):
+async def register(req: RegisterRequest, request: Request):
     settings = _auth_settings()
     if not settings["enabled"]:
         raise HTTPException(status_code=403, detail="Auth disabled")
+    # register pe strict rate limit — unlimited public registration = attacker
+    # pehle admin-bootstrap race jeet sakta hai + username enumeration.
+    # 10/hour/IP — self-hosted scale ke liye kaafi, abuse rokne ke liye bhi.
+    await _enforce_rate_limit(request, "register", 10, 3600)
 
     existing = await database.get_user_by_username(req.username)
     if existing:
@@ -337,16 +501,21 @@ async def register(req: RegisterRequest):
 
     # role: env ADMIN_USERS me naam ho → admin. Env set hai toh koi bhi
     # random pehla user auto-admin NAHI banega (sirf owner). Env khali
-    # (local dev / self-host) pe pehla registered user admin hota hai.
+    # (local dev / self-host) pe bootstrap_admin config (default true) hone
+    # pe pehla registered user admin hota hai. `bootstrap_admin: false`
+    # production ke liye — admin sirf ADMIN_USERS se.
+    bootstrap = bool(_load_config().get("auth", {}).get("bootstrap_admin", True))
     if req.username in settings["admin_usernames"]:
         role = "admin"
     elif settings["admin_usernames"]:
         role = "user"
-    else:
+    elif bootstrap:
         count = await database.count_users()
         role = "admin" if count == 0 else "user"
+    else:
+        role = "user"
 
-    password_hash, salt = hash_password(req.password)
+    password_hash, salt = await asyncio.to_thread(hash_password, req.password)
     user = await database.create_user(
         username=req.username,
         password_hash=password_hash,
@@ -368,18 +537,22 @@ async def register(req: RegisterRequest):
 
 
 @app.post("/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
     settings = _auth_settings()
     if not settings["enabled"]:
         raise HTTPException(status_code=403, detail="Auth disabled")
+    # login brute-force protection — IP pe sliding window
+    await _enforce_rate_limit(request, "login", 10, 60)
 
     user = await database.get_user_by_username(req.username)
-    if not user or not verify_password(req.password, user.password_hash, user.salt):
+    if not user or not await asyncio.to_thread(
+        verify_password, req.password, user.password_hash, user.salt
+    ):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # Purane PBKDF2 hash ko scrypt pe migrate karo (login pe ek baar re-hash)
     if not is_scrypt_hash(user.password_hash):
-        new_hash, _ = hash_password(req.password, user.salt)
+        new_hash, _ = await asyncio.to_thread(hash_password, req.password, user.salt)
         migrated = await database.set_password(user.id, new_hash, user.salt)
         if migrated is not None:
             user = migrated
@@ -417,6 +590,7 @@ async def auth_me(request: Request):
 async def rotate_key(request: Request):
     settings = _auth_settings()
     user = await _require_user(request, settings)
+    await _enforce_rate_limit(request, "rotate-key", 10, 60)
     db_user = await database.rotate_api_key(user.id, generate_api_key())
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -425,20 +599,28 @@ async def rotate_key(request: Request):
 
 @app.post("/auth/change-password")
 async def change_password(req: ChangePasswordRequest, request: Request):
-    """Apna password badlo — old password verify karke (ya admin pehli baar set)."""
+    """Apna password badlo — old password verify karke (hamesha).
+
+    Pehle `old_password` khali chhod kar koi bhi valid JWT wala password
+    reset kar sakta tha (silent account takeover). Ab old password zaroori
+    hai — jo JWT me hai use password nahi pata, wo change nahi kar sakta.
+    """
     settings = _auth_settings()
     user = await _require_user(request, settings)
+    await _enforce_rate_limit(request, "change-password", 5, 60)
 
     db_user = await database.get_user_by_id(user.id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # old password check — optional agar old_password khali hai (first-time set)
-    if req.old_password:
-        if not verify_password(req.old_password, db_user.password_hash, db_user.salt):
-            raise HTTPException(status_code=401, detail="Old password galat hai")
+    if not req.old_password:
+        raise HTTPException(status_code=401, detail="Old password zaroori hai")
+    if not await asyncio.to_thread(
+        verify_password, req.old_password, db_user.password_hash, db_user.salt
+    ):
+        raise HTTPException(status_code=401, detail="Old password galat hai")
 
-    password_hash, salt = hash_password(req.new_password)
+    password_hash, salt = await asyncio.to_thread(hash_password, req.new_password)
     updated = await database.set_password(user.id, password_hash, salt)
     if updated is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -482,6 +664,9 @@ async def sync_put_state(req: SyncStateRequest, request: Request, scope: str = "
     """User ke ek scope ka data save karo — server bas store karta hai (last-write-wins)."""
     settings = _auth_settings()
     user = await _require_user(request, settings)
+    # disk-fill protection — bina bound ke state koi bhi bhej dega to disk bharegi
+    if len(json.dumps(req.state, ensure_ascii=False)) > 2_000_000:  # ~2 MB
+        raise HTTPException(status_code=413, detail="State 2MB se bada hai")
     saved = await usersync.save_user_scope(user.username, scope, req.state, req.updated_at)
     return {"username": user.username, **saved}
 
@@ -1049,6 +1234,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         )
         await _record_tokens(user, int(tokens))
 
+    # Defensive guard — blank reply (empty / whitespace / zero-width only)
+    # kabhi bhi user tak na pahunche. Router ise already failure treat karta
+    # hai, par belt-and-suspenders: agar kisi path se phir bhi aa jaye toh 502.
+    if is_blank_text(result.text) and not result.tool_calls:
+        if user:
+            await _refund_quota(user)
+        logger.warning(
+            "chat: BLANK reply router se aa gaya (%s/%s) — zero-width/whitespace",
+            result.provider,
+            result.model,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="AI model ne khaali reply diya (saara token budget thinking me chala gaya). Thodi der baad try karo ya max_tokens badhao.",
+        )
+
     return JSONResponse(
         content={
             "id": "chatcmpl-rotator",
@@ -1091,7 +1292,12 @@ async def _authenticate(request: Request, settings: dict):
         return await database.get_user_by_api_key(token)
     payload = decode_jwt(token, settings["jwt_secret"])
     if payload:
-        return await database.get_user_by_id(int(payload["sub"]))
+        try:
+            return await database.get_user_by_id(int(payload["sub"]))
+        except (KeyError, ValueError, TypeError):
+            # validly-signed token me sub galat type/format — generic 500 na de
+            logger.warning("auth: JWT payload me invalid 'sub' (%r)", payload.get("sub"))
+            return None
     return None
 
 

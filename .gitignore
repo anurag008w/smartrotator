@@ -8,3 +8,14 @@ proxies.txt
 .DS_Store
 *.db
 *.sqlite3
+
+# data/ track hota hai (user ne choose kiya) — users.json/providers.json ke
+# API keys at-rest ENCRYPTED hote hain. Secret dotfiles (enc key, jwt secret)
+# hamesha ignored rehte hain — inke bina encrypted data unlock nahi hota.
+data/*
+!data/*.json
+!data/sync/
+!data/sync/**
+test_data_*/
+*.tmp
+.corrupt-*

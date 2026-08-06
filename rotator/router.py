@@ -36,6 +36,8 @@ from .providers import (
     ProviderError,
     RateLimitError,
     build_provider,
+    clean_text,
+    is_blank_text,
 )
 
 
@@ -535,10 +537,15 @@ class Rotator:
                 result.model = resolved_model
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_success(proxy)
+                # provider jo bhi dirty text de (whitespace/zero-width wrapped),
+                # clean karke hi aage bhejo — blank check iske BAAD karo.
+                result.text = clean_text(result.text)
                 # Empty reply (reasoning model ne saara budget thinking me
-                # kha liya, ya sirf whitespace bheja) → failure treat karke
-                # agli key/model try karo.
-                if not result.text.strip() and not result.tool_calls:
+                # kha liya, ya sirf whitespace/zero-width chars bheja) →
+                # failure treat karke agli key/model try karo. is_blank_text
+                # `.strip()` se zyada strict hai — invisible unicode bhi pakadta
+                # hai (warna blank reply user tak pahunch jata tha).
+                if is_blank_text(result.text) and not result.tool_calls:
                     ring.report_failure(state, resolved_model)
                     last_error = ProviderError(
                         f"{st.cfg.name}/{resolved_model}: empty reply "

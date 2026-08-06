@@ -54,6 +54,16 @@ _last_push_fingerprint: str = ""
 
 
 # ── Helpers ─────────────────────────────────────────
+def _redact(text: str) -> str:
+    """Logs me GH_TOKEN kabhi na dikhe — git stderr me authenticated URL aata hai."""
+    if not text:
+        return text
+    if GH_TOKEN and GH_TOKEN in text:
+        text = text.replace(GH_TOKEN, "***")
+    # anonymous-style token bhi replace (ghp_xxx patterns)
+    return text
+
+
 def _run(cmd: list[str], check: bool = False, capture: bool = True, timeout: int = 60, cwd: str | None = None) -> subprocess.CompletedProcess:
     """Run a command safely with timeout."""
     try:
@@ -61,7 +71,7 @@ def _run(cmd: list[str], check: bool = False, capture: bool = True, timeout: int
             cmd, capture_output=capture, text=True, timeout=timeout, cwd=cwd
         )
         if check and result.returncode != 0:
-            raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
+            raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{_redact(result.stderr)}")
         return result
     except FileNotFoundError:
         return subprocess.CompletedProcess(cmd, returncode=127, stdout="", stderr="command not found")
@@ -220,12 +230,12 @@ def push_data(force_mode: str = "normal") -> bool:
             push_flag = "--force-with-lease" if force_mode == "force-with-lease" else ""
             r = _run(["git", "push", "-u", "origin", "main"] + ([push_flag] if push_flag else []), cwd=str(repo_dir), timeout=90)
             if r.returncode != 0:
-                stderr = (r.stderr or "").lower()
+                stderr = _redact(r.stderr or "").lower()
                 if any(k in stderr for k in ("rejected", "diverged", "non-fast-forward", "failed to push")):
-                    log.warning("normal push rejected, retrying --force: %s", (r.stderr or "").strip()[:300])
+                    log.warning("normal push rejected, retrying --force: %s", _redact((r.stderr or "").strip()[:300]))
                     r = _run(["git", "push", "-u", "origin", "main", "--force"], cwd=str(repo_dir), timeout=90)
             if r.returncode != 0:
-                log.error("github_sync: push failed: %s", (r.stderr or "").strip()[:400])
+                log.error("github_sync: push failed: %s", _redact((r.stderr or "").strip()[:400]))
                 return False
         mark_pushed()
         log.info("github_sync: pushed data to %s", _safe_url())

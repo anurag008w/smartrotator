@@ -16,6 +16,18 @@
 #   GITHUB_REPO="youruser/smartrotator-data"   (private repo — auto-create)
 #   GITHUB_SYNC_ENABLED="true"
 #   GITHUB_SYNC_INTERVAL="180"    (3 min)
+#
+# SECURITY (production grade):
+#   - JWT_SECRET na do → server pehli baar pe data/.jwt-secret auto-generate
+#     karega (chmod 600). Production me env se DO, taaki restart pe token
+#     invalidate na hon.
+#   - STORE_ENC_KEY optional: API keys at-rest AES-256-GCM se encrypt hain.
+#     Agar env se na do, data/.store-enc-key (git-ignored) auto-generate
+#     hota hai. AGAR ye file kharab/lost ho → stored keys unrecoverable,
+#     isliye production me env se dena best hai.
+#   - data/ ab git me track hota hai (public repo!). Api keys hamesha
+#     encrypted rahte hain; .jwt-secret / .store-enc-key / .sync-enc-key
+#     kabhi sync nahi hote (dotfiles ignore).
 
 services:
   - type: web
@@ -41,6 +53,8 @@ services:
       - key: ZEN_KEYS
         sync: false
       - key: JWT_SECRET
+        sync: false
+      - key: STORE_ENC_KEY
         sync: false
       - key: ADMIN_USERS
         sync: false

@@ -22,6 +22,41 @@ import httpx
 
 GEMINI_V1 = "https://generativelanguage.googleapis.com/v1beta"
 
+# Zero-width / invisible Unicode characters — ye Python ke str.strip() se
+# nahi hattе (isspace() False), par user ko blank reply dikhata hai.
+# Kuch models (khaas kar reasoning/formatting wale) ye emit karte hain.
+_INVISIBLE_CHARS = (
+    "\u200b\u200c\u200d\u200e\u200f"   # ZWSP ZWNJ ZWJ LRM RLM
+    "\u2060\u2061\u2062\u2063\u2064"   # word joiner + invisible operators
+    "\ufeff\u00ad\u180e"               # BOM/ZWNBSP, soft hyphen, MVS
+    "\u202a\u202b\u202c\u202d\u202e"   # bidi embedding controls
+    "\u061c"                           # arabic letter mark
+)
+
+
+def clean_text(text: str) -> str:
+    """Whitespace + zero-width invisible chars dono ends se strip karo.
+
+    `.strip()` zero-width ko nahi hataata isliye blank replies user tak
+    pahunch jaate the. Ab clean text hi aage jata hai.
+    """
+    if not text:
+        return ""
+    out = text
+    # whitespace aur invisible alag char classes hain — ek alternate loop
+    # dono ko expose karke strip karta hai (max 3 passes kaafi hain).
+    for _ in range(3):
+        nxt = out.strip(_INVISIBLE_CHARS).strip()
+        if nxt == out:
+            break
+        out = nxt
+    return out
+
+
+def is_blank_text(text: str) -> bool:
+    """Empty / whitespace-only / zero-width-only → True (blank reply)."""
+    return not clean_text(text)
+
 
 # --------------------------------------------------------------------------
 # Data models
@@ -290,12 +325,12 @@ class OpenAICompatibleProvider(Provider):
                     f"{self.name}: unexpected response — choice has no 'message': {resp.text[:200]}",
                     status_code=502,
                 )
-            # content ko strip karo — reasoning models aage/peeche whitespace
-            # chhodte hain (aur thinking-budget khatam hone pe sirf whitespace
-            # bhi aata hai). Clean text hi user tak jaaye; agar strip ke baad
-            # kuch na bache toh router empty treat karke agli key/model try
-            # karega.
-            text = (message.get("content") or "").strip()
+            # content ko clean karo — reasoning models aage/peeche whitespace
+            # aur zero-width invisible chars chhodte hain (aur thinking-budget
+            # khatam hone pe sirf ye hi aata hai). Clean text hi user tak
+            # jaaye; agar clean ke baad kuch na bache toh router empty treat
+            # karke agli key/model try karega.
+            text = clean_text(message.get("content") or "")
             # DeepSeek R1 jaise reasoning models content ke alawa
             # `reasoning_content` bhejte hain (thinking output). Isse visible
             # content me KABHI mix mat karo — alag field me rakho taaki client
@@ -591,12 +626,12 @@ class GeminiProvider(Provider):
     @staticmethod
     def _extract_text(data: dict) -> str:
         # `thought: true` parts model ki thinking hoti hai — use visible content
-        # me KABHI mat mix karo. Sirf asli answer join hota hai.
+        # me KABHI mix mat karo. Sirf asli answer join hota hai.
         try:
             parts = data["candidates"][0]["content"]["parts"]
         except (KeyError, IndexError):
             return ""
-        return "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+        return clean_text("".join(p.get("text", "") for p in parts if not p.get("thought")))
 
     @staticmethod
     def _extract_thoughts(data: dict) -> str:
