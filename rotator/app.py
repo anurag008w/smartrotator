@@ -482,7 +482,7 @@ async def status(request: Request):
     if settings["enabled"]:
         await _require_any_admin(request)
     rotator: Rotator = request.app.state.rotator
-    return rotator.status()
+    return {**rotator.status(), "github_sync": github_sync.sync_status()}
 
 
 # --------------------------------------------------------------------------

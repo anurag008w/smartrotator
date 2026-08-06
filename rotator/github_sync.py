@@ -51,6 +51,9 @@ except (ValueError, TypeError):
 
 # ── Fingerprint cache for smart auto-push ──────────
 _last_push_fingerprint: str = ""
+# Boot pull sahi raha kya? False = pull fail hua — tab tak PUSH mat karo
+# (warna fresh/khali state GitHub ke sahi data ke upar chali jayegi).
+_last_pull_ok: bool = False
 
 
 # ── Helpers ─────────────────────────────────────────
@@ -177,12 +180,40 @@ def ensure_repo() -> bool:
 
 
 # ── Git push (data dir → GitHub) ────────────────────
+def _data_ready_to_push() -> bool:
+    """Push karne se pehle check: kya data complete/seeded hai?
+
+    Sirf usage/sync-files + 0 users = fresh-boot (pull fail hua) ya partial
+    state — aisa data GitHub ke sahi data ke upar push karna data-loss hai.
+    users.json missing ya 0 users → skip. Admin bhi hamesha hota hai, isliye
+    0 users kabhi valid durable state nahi hai."""
+    users_path = DATA_DIR / "users.json"
+    if not users_path.exists():
+        log.warning("github_sync: users.json nahi hai — push skip (pull fail ya fresh boot)")
+        return False
+    try:
+        raw = json.loads(users_path.read_text(encoding="utf-8"))
+        users = raw.get("users", []) if isinstance(raw, dict) else []
+    except (json.JSONDecodeError, OSError) as exc:
+        log.warning("github_sync: users.json padh nahi paya (%s) — push skip", exc)
+        return False
+    if not users:
+        log.warning("github_sync: users.json me 0 users — push skip (sahi data overwrite na ho)")
+        return False
+    return True
+
+
 def push_data(force_mode: str = "normal") -> bool:
     """Local data/ ko GitHub pe push karo. True on success."""
     if not is_enabled():
         return False
+    if not _last_pull_ok:
+        log.warning("github_sync: boot pull abhi tak successful nahi — push skip")
+        return False
     if not DATA_DIR.exists() or not any(DATA_DIR.iterdir()):
         log.info("github_sync: data dir empty, nothing to push")
+        return False
+    if not _data_ready_to_push():
         return False
 
     try:
@@ -248,22 +279,27 @@ def push_data(force_mode: str = "normal") -> bool:
 # ── Git pull (GitHub → local) ───────────────────────
 def pull_data(force_mode: str = "normal") -> bool:
     """GitHub repo se local data/ me latest lao. True on success."""
+    global _last_pull_ok
     if not is_enabled():
+        _last_pull_ok = False
         return False
     try:
         if "/" not in REPO_NAME or _api_request("GET", f"/repos/{REPO_NAME}") is None:
             log.info("github_sync: repo %s nahi mila — data shuru se", REPO_NAME)
+            _last_pull_ok = False
             return False
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             r = _run(["git", "clone", "--depth", "1", _auth_url(), str(tmp_path / "repo")], timeout=90)
             if r.returncode != 0:
                 log.warning("github_sync: clone failed: %s", (r.stderr or "").strip()[:300])
+                _last_pull_ok = False
                 return False
             repo_dir = tmp_path / "repo"
             items = [f for f in repo_dir.iterdir() if f.name not in (".git", ".gitignore")]
             if not items:
                 log.info("github_sync: remote repo empty")
+                _last_pull_ok = True
                 return True
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             # local non-hidden files replace karo
@@ -284,15 +320,21 @@ def pull_data(force_mode: str = "normal") -> bool:
                     shutil.copy2(item, dst)
         log.info("github_sync: pulled %d items from %s", len(items), _safe_url())
         mark_pushed()
+        _last_pull_ok = True
         return True
     except Exception as exc:
         log.error("github_sync: pull error: %s", exc)
+        _last_pull_ok = False
         return False
 
 
 # ── Background sync loop (har 3 min) ────────────────
 async def sync_loop(stop_event: asyncio.Event | None = None) -> None:
-    """Background task — har GITHUB_SYNC_INTERVAL pe data change check + push."""
+    """Background task — har GITHUB_SYNC_INTERVAL pe data change check + push.
+
+    Agar boot pull fail hua tha, har loop me PEHLE pull retry karo — jab tak
+    pull successful na ho, push nahi hoga (taaki fresh/khali data GitHub ke
+    sahi data ke upar na jaye)."""
     if not is_enabled():
         return
     # startup pe ek baar immediate sync (data badla ho toh)
@@ -306,6 +348,12 @@ async def sync_loop(stop_event: asyncio.Event | None = None) -> None:
         if stop_event is not None and stop_event.is_set():
             break
         try:
+            # boot pull fail hua tha? pehle dobara pull karo (GitHub transient
+            # ho sakta hai) — push tabhi jab pull ok ho.
+            if not _last_pull_ok:
+                log.warning("github_sync: boot pull fail tha — dobara pull try")
+                await asyncio.to_thread(pull_data)
+                continue
             if has_data_changed():
                 await asyncio.to_thread(push_data)
         except Exception as exc:
@@ -320,4 +368,5 @@ def sync_status() -> dict:
         "interval_seconds": GITHUB_SYNC_INTERVAL,
         "data_dir": str(DATA_DIR),
         "data_changed": has_data_changed(),
+        "pull_ok": _last_pull_ok,
     }

@@ -134,7 +134,21 @@ def _read_json(path: Path, default):
     if not path.exists():
         return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        # Duplicate JSON keys = file corrupt/merge hui thi (usage.json me yeh
+        # dekha hai). Last-wins (Python default), par warning do taaki pata
+        # chale — aur aisi file dobara se push na ho.
+        def _pairs_hook(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    logger.warning(
+                        "store: %s duplicate key '%s' — last wins (file repair karo)",
+                        path.name, k,
+                    )
+                d[k] = v
+            return d
+        return json.loads(text, object_pairs_hook=_pairs_hook)
     except (json.JSONDecodeError, OSError) as exc:
         _corrupt_files.add(path)
         try:
