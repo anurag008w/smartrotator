@@ -883,7 +883,9 @@ def build_provider(
     web_search_passthrough: bool = False,
 ) -> Provider:
     if ptype == "gemini":
-        return GeminiProvider(models)
+        # custom base_url (Cloudflare Worker gateway / proxy / alt endpoint)
+        # allowed — default Google endpoint tab use hota hai jab koi nahi diya
+        return GeminiProvider(models, base_url or GEMINI_V1)
     if ptype == "openai":
         if not base_url:
             raise ValueError(f"provider '{name}': openai type needs base_url")

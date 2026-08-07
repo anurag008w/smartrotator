@@ -21,6 +21,12 @@ providers:
   # ---------- GOOGLE GEMINI (best free tier: 1500 RPD, vision native) ----------
   - name: gemini
     type: gemini
+    # base_url OPTIONAL — default: https://generativelanguage.googleapis.com/v1beta
+    # Custom gateway/proxy use karna ho (jaise Cloudflare Worker routing trick)
+    # toh apna URL yahan daalo, ending "/v1beta" ke saath, e.g.:
+    #   base_url: https://your-worker.workers.dev/v1beta
+    # ya direct googleapi alt-endpoint:
+    #   base_url: https://generativelanguage.googleapis.com/v1beta
     models:
       - gemini-2.5-flash        # fast + vision + image input
       # - gemini-2.5-pro        # strong, but sirf 50 RPD free me

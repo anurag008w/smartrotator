@@ -57,6 +57,7 @@ from .auth import (
 from .providers import (
     AllProvidersExhausted,
     ChatMessage,
+    GEMINI_V1,
     ImageInput,
     ProviderError,
     RateLimitError,
@@ -409,6 +410,7 @@ class CustomProviderInput(BaseModel):
     api_keys: list[str] = Field([], max_length=100)
     models: list[str] = Field([], max_length=100)
     enabled: bool = True
+    replace_keys: bool = False    # true = purani keys hatake nayi lagao
 
 
 # --------------------------------------------------------------------------
@@ -917,6 +919,15 @@ def _key_preview(key: str) -> str:
     return f"{key[:6]}...{key[-4:]}"
 
 
+def _default_base_url(ptype: str) -> str:
+    """Provider type ke liye default base_url (UI me empty chhodne pe use hota hai)."""
+    if ptype == "gemini":
+        return GEMINI_V1
+    if ptype == "openai":
+        return ""
+    return ""
+
+
 def _live_cache(request: Request) -> dict:
     cache = getattr(request.app.state, "live_models_cache", None)
     if cache is None:
@@ -1017,25 +1028,88 @@ def _live_models_for_list(request: Request) -> list[dict]:
 # --------------------------------------------------------------------------
 @app.get("/admin/providers")
 async def admin_providers(request: Request):
-    """Custom providers list + live models cache status."""
+    """Providers ka editor view — config.yaml wale + custom wale DONO.
+
+    UI ke "🔌 Providers" tab ke liye: har provider ka base_url, models,
+    masked key previews aur enabled state milta hai taaki admin bina
+    config.yaml chhede sab set kar sake. Keys kabhi plaintext return
+    nahi hoti (sirf preview) — POST karte waqt nayi keys bheji jaati hain.
+    """
     await _require_admin(request)
-    custom = await database.list_custom_providers()
-    # public view: keys ko mask karo (dashboard pe sirf count dikhega)
-    public = []
-    for p in custom:
-        # rule: bina API key wale providers kisi bhi tab me nahi dikhte
-        if not p.get("api_keys"):
-            continue
-        public.append(
-            {
-                "name": p.get("name"),
+    rotator: Rotator = request.app.state.rotator
+
+    # 1) config.yaml wale providers (raw config se — default base_url/models)
+    config_providers: dict[str, dict] = {}
+    try:
+        for p in _load_config().get("providers", []):
+            name = (p.get("name") or "").strip()
+            if not name:
+                continue
+            config_providers[name] = {
+                "name": name,
                 "type": p.get("type", "openai"),
                 "base_url": p.get("base_url", ""),
-                "key_count": len(p.get("api_keys", [])),
-                "models": p.get("models", []),
-                "enabled": p.get("enabled", True),
+                "models": [m.strip() for m in p.get("models", []) if m.strip()],
+                "enabled": True,
+                "source": "config",
+                "key_count": 0,
+                "keys": [],
             }
-        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 2) runtime state se env-keys wale base_url/key_count sync karo
+    for st in rotator.providers:
+        entry = config_providers.get(st.cfg.name)
+        if entry is None:
+            # runtime me hai par config me nahi (dashboard se add kiya tha)
+            entry = {
+                "name": st.cfg.name,
+                "type": st.cfg.ptype,
+                "base_url": st.cfg.base_url or "",
+                "models": list(st.cfg.models),
+                "enabled": True,
+                "source": "runtime",
+                "key_count": len(st.cfg.keys),
+                "keys": [{"index": i, "preview": _key_preview(k)} for i, k in enumerate(st.cfg.keys)],
+            }
+            config_providers[st.cfg.name] = entry
+        else:
+            entry["key_count"] = len(st.cfg.keys)
+            entry["keys"] = [
+                {"index": i, "preview": _key_preview(k)} for i, k in enumerate(st.cfg.keys)
+            ]
+            if st.cfg.base_url:
+                entry["base_url"] = st.cfg.base_url
+
+    # 3) custom providers (dashboard se add) — inki encrypted keys store me hain
+    custom = await database.list_custom_providers()
+    custom_names = set()
+    for p in custom:
+        name = (p.get("name") or "").strip()
+        if not name:
+            continue
+        custom_names.add(name)
+        config_providers[name] = {
+            "name": name,
+            "type": p.get("type", "openai"),
+            "base_url": p.get("base_url", ""),
+            "models": [m.strip() for m in p.get("models", []) if m.strip()],
+            "enabled": p.get("enabled", True),
+            "source": "custom",
+            "key_count": len(p.get("api_keys", [])),
+            "keys": [
+                {"index": i, "preview": _key_preview(k)}
+                for i, k in enumerate(p.get("api_keys", []))
+            ],
+        }
+
+    # consistent order: config order pehle, phir naye custom
+    all_names = list(config_providers.keys())
+    ordered = [
+        config_providers[n] for n in all_names if n not in custom_names
+    ] + [config_providers[n] for n in all_names if n in custom_names]
+
     cache = _live_cache(request)
     status = []
     for name, entry in cache.items():
@@ -1047,12 +1121,20 @@ async def admin_providers(request: Request):
                 "error": entry.get("error"),
             }
         )
-    return {"providers": public, "cache": status}
+    return {"providers": ordered, "cache": status}
 
 
 @app.post("/admin/providers")
 async def admin_add_provider(req: CustomProviderInput, request: Request):
-    """Naya provider add karo (ya same name pe update) + live apply."""
+    """Naya provider add karo (ya same name pe update) + live apply.
+
+    UI "🔌 Providers" tab se base_url / keys / models update karne ke liye:
+      - `api_keys` empty bhejo + `replace_keys: false`  → existing keys preserve
+      - `api_keys` + `replace_keys: false`             → nayi keys MERGE hoti hain
+      - `replace_keys: true`                           → purani keys hatake nayi
+      - `base_url` empty bhejo                         → existing preserve
+      - `models` empty bhejo                           → existing preserve
+    """
     await _require_admin(request)
 
     name = req.name.strip()
@@ -1061,18 +1143,68 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
     ptype = req.type.strip().lower()
     if ptype not in ("gemini", "openai"):
         raise HTTPException(status_code=400, detail="type must be 'gemini' or 'openai'")
-    if ptype == "openai" and not req.base_url.strip():
+
+    rotator: Rotator = request.app.state.rotator
+    existing = await database.get_custom_provider(name)
+
+    # runtime provider state (config.yaml + env keys) — custom update me
+    # existing keys preserve karne ke liye (merge bahaviour)
+    runtime_st = rotator._find_provider(name)
+    runtime_cfg = {"base_url": "", "keys": [], "models": []}
+    if runtime_st is not None:
+        runtime_cfg = {
+            "base_url": runtime_st.cfg.base_url or "",
+            "keys": list(runtime_st.cfg.keys),
+            "models": list(runtime_st.cfg.models),
+        }
+
+    # ---- base_url: empty → existing custom / runtime config preserve ----
+    base_url = req.base_url.strip()
+    if not base_url:
+        if existing and existing.get("base_url"):
+            base_url = existing["base_url"]
+        elif runtime_cfg["base_url"]:
+            base_url = runtime_cfg["base_url"]
+        else:
+            base_url = _default_base_url(ptype)
+    if ptype == "openai" and not base_url:
         raise HTTPException(status_code=400, detail="openai provider needs base_url")
 
-    keys = [k.strip() for k in req.api_keys if k.strip()]
+    # ---- keys: merge / replace / preserve ----
+    new_keys = [k.strip() for k in req.api_keys if k.strip() and not k.startswith("PASTE_")]
+    if existing:
+        old_keys = list(existing.get("api_keys", []))
+    else:
+        # custom nahi hai → runtime (config/env) keys preserve karo
+        old_keys = [k for k in runtime_cfg["keys"] if not k.startswith("PASTE_")]
+    if req.replace_keys:
+        keys = new_keys
+    elif new_keys:
+        # merge — duplicate na ho
+        keys = old_keys[:]
+        seen = set(keys)
+        for k in new_keys:
+            if k not in seen:
+                seen.add(k)
+                keys.append(k)
+    else:
+        keys = old_keys
     if not keys:
         raise HTTPException(status_code=400, detail="At least one API key required")
+
+    # ---- models: empty → existing custom / runtime config preserve ----
     models = [m.strip() for m in req.models if m.strip()]
+    if not models and existing and existing.get("models"):
+        models = [m.strip() for m in existing.get("models", []) if m.strip()]
+    if not models and runtime_cfg["models"]:
+        models = runtime_cfg["models"]
+    if not models:
+        raise HTTPException(status_code=400, detail="At least one model required")
 
     provider = {
         "name": name,
         "type": ptype,
-        "base_url": req.base_url.strip(),
+        "base_url": base_url,
         "api_keys": keys,
         "models": models,
         "enabled": req.enabled,
@@ -1080,7 +1212,6 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
     await database.upsert_custom_provider(provider)
 
     # live apply karo
-    rotator: Rotator = request.app.state.rotator
     custom = await database.list_custom_providers()
     rotator.apply_custom_providers(custom)
 
@@ -1093,6 +1224,7 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
     return {
         "ok": True,
         "message": f"Provider '{name}' add/update ho gaya",
+        "key_count": len(keys),
         "live": (entry or {}).get("models", []),
         "live_error": (entry or {}).get("error"),
     }
@@ -1780,6 +1912,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="tab" onclick="showView('settings')">⚙️ Settings</div>
       <div class="tab" id="modelsTab" style="display:none" onclick="showView('models'); loadModelsAdmin();">🧠 Models</div>
       <div class="tab" id="exposedTab" style="display:none" onclick="showView('exposed'); loadExposed();">🎚 Exposed</div>
+      <div class="tab" id="providersTab" style="display:none" onclick="showView('providers'); loadProvidersAdmin();">🔌 Providers</div>
       <div class="tab" id="adminTab" style="display:none" onclick="showView('admin'); loadAdmin();">🛡 Admin</div>
     </div>
 
@@ -1930,6 +2063,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="exposed-list"><span class="muted">Loading…</span></div>
       </div>
     </div>
+
+    <!-- PROVIDERS ADMIN (base_url + API keys UI se set karo) -->
+    <div class="view" id="view-providers">
+      <div class="card">
+        <h3 style="margin-bottom:4px">🔌 Provider Settings</h3>
+        <div class="muted" style="margin-bottom:10px">Har provider ka <b>base_url</b> + jitni chaaho <b>API keys</b> yahan se set karo — bina config.yaml chhede. Keys <b>add/merge</b> hoti hain (purani delete karne ke liye 🗑 provider delete karke dobara banao). Custom gateway (Cloudflare Worker etc.) ka URL yahan daalo — saare providers ke liye chalta hai. 💾 Save ke baad live apply hota hai.</div>
+        <div class="err" id="providers-err"></div>
+        <div class="ok" id="providers-ok"></div>
+        <div id="providers-list"><span class="muted">Loading…</span></div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -1962,6 +2106,7 @@ function showMain(user, isSuperAdmin) {
   const isAnyAdmin = isSuperAdmin || user.role === 'admin';
   document.getElementById('modelsTab').style.display = isAnyAdmin ? '' : 'none';
   document.getElementById('exposedTab').style.display = isAnyAdmin ? '' : 'none';
+  document.getElementById('providersTab').style.display = isSuperAdmin ? '' : 'none';
   document.getElementById('adminTab').style.display = isSuperAdmin ? '' : 'none';
 }
 function authTab(which) {
@@ -2599,6 +2744,89 @@ async function refreshExposedLive() {
   const lines = (data.results || []).map(r => `${r.name}: ${r.count}${r.error ? ' (❌)' : ''}`).join(' · ');
   if (st) st.textContent = '✅ ' + lines;
   await loadExposed();
+}
+
+// ---------- providers admin (base_url + keys UI se) ----------
+let providersData = null;
+async function loadProvidersAdmin() {
+  const box = document.getElementById('providers-list');
+  box.innerHTML = '<span class="muted">Loading…</span>';
+  document.getElementById('providers-err').textContent = '';
+  document.getElementById('providers-ok').textContent = '';
+  const { res, data } = await api('/admin/providers');
+  if (!res.ok) { box.innerHTML = '<span class="err">' + (data.detail || 'Load failed') + '</span>'; return; }
+  providersData = data;
+  renderProviders();
+}
+function renderProviders() {
+  const box = document.getElementById('providers-list');
+  const list = (providersData && providersData.providers) || [];
+  if (!list.length) { box.innerHTML = '<div class="muted">Koi provider nahi — config.yaml + API keys daalo.</div>'; return; }
+  box.innerHTML = list.map((p, idx) => {
+    const isCustom = p.source === 'custom';
+    const keyPreviews = (p.keys || []).map(k => '<code style="background:var(--panel2);padding:2px 5px;border-radius:4px;margin-right:6px">' + k.preview + '</code>').join('');
+    return `
+    <div class="provider-card" style="border:1px solid var(--panel2);border-radius:10px;padding:14px;margin-bottom:12px;background:var(--bg)">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+        <b>${p.name}</b>
+        <span class="badge" style="background:var(--panel2);padding:2px 8px;border-radius:10px;font-size:12px">${p.type}</span>
+        ${isCustom ? '<span class="badge" style="background:#ffd70022;color:#e8c34c;padding:2px 8px;border-radius:10px;font-size:12px">custom</span>' : '<span class="badge" style="background:var(--panel2);padding:2px 8px;border-radius:10px;font-size:12px">config</span>'}
+        <span class="muted" style="font-size:12px">${p.key_count} key${p.key_count === 1 ? '' : 's'}</span>
+        ${p.enabled ? '' : '<span class="badge" style="background:#f4433622;color:#f66;padding:2px 8px;border-radius:10px;font-size:12px">disabled</span>'}
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <label class="muted" style="font-size:12px">Base URL
+          <input id="prov-base-${idx}" type="text" value="${(p.base_url || '').replace(/"/g, '&quot;')}" placeholder="empty = default" style="width:100%;margin-top:4px">
+        </label>
+        <label class="muted" style="font-size:12px">Models (comma separated)
+          <input id="prov-models-${idx}" type="text" value="${(p.models || []).join(', ').replace(/"/g, '&quot;')}" placeholder="model-1, model-2" style="width:100%;margin-top:4px">
+        </label>
+      </div>
+      <label class="muted" style="font-size:12px;display:block;margin-top:10px">Add API Keys (ek line per key — existing keys ke saath merge hongi)
+        <textarea id="prov-keys-${idx}" rows="2" placeholder="key1&#10;key2&#10;key3" style="width:100%;margin-top:4px"></textarea>
+      </label>
+      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:4px"><input id="prov-replace-${idx}" type="checkbox"> replace existing keys</label>
+        <span class="muted" style="font-size:12px"><input id="prov-enabled-${idx}" type="checkbox" ${p.enabled ? 'checked' : ''}> enabled</span>
+        <button class="btn" onclick="saveProviderAdmin(${idx}, ${JSON.stringify(p.name).replace(/"/g, '&quot;')})">💾 Save</button>
+        ${isCustom ? `<button class="btn sec" onclick="deleteProviderAdmin(${JSON.stringify(p.name).replace(/"/g, '&quot;')})">🗑 Delete</button>` : ''}
+      </div>
+      <div style="margin-top:6px">${keyPreviews}</div>
+    </div>`;
+  }).join('');
+}
+async function saveProviderAdmin(idx) {
+  const p = providersData.providers[idx];
+  document.getElementById('providers-err').textContent = '';
+  document.getElementById('providers-ok').textContent = '';
+  const body = {
+    name: p.name,
+    type: p.type,
+    base_url: document.getElementById('prov-base-' + idx).value.trim(),
+    models: document.getElementById('prov-models-' + idx).value.split(',').map(s => s.trim()).filter(Boolean),
+    api_keys: document.getElementById('prov-keys-' + idx).value.split('\n').map(s => s.trim()).filter(Boolean),
+    enabled: document.getElementById('prov-enabled-' + idx).checked,
+    replace_keys: document.getElementById('prov-replace-' + idx).checked,
+  };
+  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Save failed'; return; }
+  document.getElementById('providers-ok').textContent = data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
+  await loadProvidersAdmin();
+}
+async function deleteProviderAdmin(name) {
+  if (!confirm('Delete provider "' + name + '"?')) return;
+  document.getElementById('providers-err').textContent = '';
+  document.getElementById('providers-ok').textContent = '';
+  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name), { method: 'DELETE' });
+  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Delete failed'; return; }
+  document.getElementById('providers-ok').textContent = data.message;
+  await loadProvidersAdmin();
+}
+async function refreshProvidersLive() {
+  const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
+  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Refresh failed'; return; }
+  document.getElementById('providers-ok').textContent = '✅ Live models refresh ho gaye';
+  await loadProvidersAdmin();
 }
 
 // ---------- tabs ----------

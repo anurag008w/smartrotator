@@ -122,6 +122,10 @@ class Rotator:
             if st is not None:
                 new_states.append(st)
 
+        # config providers ka canonical snapshot — custom merge/delete ke baad
+        # bhi isi se restore hota hai (custom override hone pe config state
+        # `providers` me replace ho jaata hai, isliye alag se rakhte hain)
+        self._config_providers = list(new_states)
         self.providers = new_states
 
         # custom providers (dashboard se add kiye) dobara apply karo
@@ -216,7 +220,11 @@ class Rotator:
 
         # same name ke custom provider se config.yaml wala override
         custom_names = {st.cfg.name for st in custom_states}
-        base_states = [st for st in self.providers if st.cfg.name not in custom_names]
+        config_states = getattr(self, "_config_providers", None)
+        if config_states is None:
+            # purana state (reload hone se pehle) — providers hi base hai
+            config_states = list(self.providers)
+        base_states = [st for st in config_states if st.cfg.name not in custom_names]
         self.providers = base_states + custom_states
 
     def _build_state(self, pcfg: ProviderConfig) -> ProviderState:
