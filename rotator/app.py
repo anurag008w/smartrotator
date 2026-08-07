@@ -1108,6 +1108,13 @@ async def admin_providers(request: Request):
         if not name:
             continue
         custom_names.add(name)
+        # sel_keys empty = router._merge_custom_states saari keys active rakhta
+        # hai (koi filter nahi) — UI ko bhi wahi "sab selected" dikhana chahiye,
+        # warna admin ko lagta hai kisi key select nahi hui, aur ek-do checkbox
+        # tick karke Save karne pe baaki keys hamesha ke liye deselect ho jaati
+        # hain (provider ke effective keys ghat jaate hain — group editor me
+        # bhi kam keys dikhti hain, "virtual model multiple keys" tootta hai).
+        sel_keys = p.get("selected_keys") or []
         config_providers[name] = {
             "name": name,
             "type": p.get("type", "openai"),
@@ -1117,13 +1124,13 @@ async def admin_providers(request: Request):
             "source": "custom",
             "key_count": len(p.get("api_keys", [])),
             "key_base_urls": dict(p.get("key_base_urls") or {}),
-            "selected_keys": p.get("selected_keys") or [],
+            "selected_keys": sel_keys,
             "keys": [
                 {
                     "index": i,
                     "preview": _key_preview(k),
                     "base_url": (p.get("key_base_urls") or {}).get(k, ""),
-                    "selected": i in (p.get("selected_keys") or []),
+                    "selected": (not sel_keys) or (i in sel_keys),
                 }
                 for i, k in enumerate(p.get("api_keys", []))
             ],
