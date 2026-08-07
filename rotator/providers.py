@@ -1049,6 +1049,7 @@ async def _fetch_live_openai(
     for key in api_keys:
         try:
             models: list[LiveModel] = []
+            seen: set[str] = set()
             after: Optional[str] = None
             fetched_at = __import__("time").time()
             headers = {"Authorization": f"Bearer {key}"}
@@ -1061,15 +1062,25 @@ async def _fetch_live_openai(
                     resp.raise_for_status()
                     data = Provider._parse_json_response(resp, name)
                     items = data.get("data", []) if isinstance(data, dict) else []
+                    new_count = 0
                     for raw in items:
                         m = _map_openai_model(raw, name, fetched_at)
-                        if m:
+                        if m and m.id not in seen:
+                            seen.add(m.id)
                             models.append(m)
+                            new_count += 1
                     # pagination: OpenAI /models pe last_id hota hai
                     last_id = data.get("last_id") if isinstance(data, dict) else None
                     if not last_id and items:
                         last_id = items[-1].get("id")
+                    # server ne poora catalog ek page me de diya (last_id nahi)
+                    # ya page < 20 items ka hai → pagination khatam.
                     if not last_id or len(items) < 20:
+                        break
+                    # NVIDIA NIM jaise providers `after` param IGNORE karke wahi
+                    # list dobara bhejte hain — naya model na aaye toh ruko
+                    # (warna 5x duplicate models milte).
+                    if new_count == 0:
                         break
                     after = last_id
             return models

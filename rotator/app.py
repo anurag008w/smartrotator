@@ -30,6 +30,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -37,7 +38,7 @@ from typing import Optional, Union
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import github_sync
@@ -842,23 +843,19 @@ async def admin_models(request: Request):
                 "live_error": entry.get("error"),
             }
         )
-    # providers jo config me hain par abhi incomplete (keys/models nahi) — bhi dikhao
-    raw_cfg = _load_config().get("providers", [])
-    known = {p["name"] for p in providers}
-    for p in raw_cfg:
-        name = p.get("name", "")
-        if name not in known:
-            providers.append(
-                {
-                    "name": name,
-                    "type": p.get("type", "openai"),
-                    "key_count": 0,
-                    "configured_models": [m for m in p.get("models", []) if not str(m).startswith("PASTE_")],
-                }
-            )
+
+    # SIRF wo providers dikhte hain jinme kam se kam ek API key configured hai.
+    # rotator.providers me sirf key-configured providers build hote hain
+    # (bina key wale `_build_state_from_cfg` me skip ho jate hain) — isliye
+    # yahan raw config fallback nahi chahiye (pehle PASTE_ placeholder wale
+    # bhi "key_count: 0" ke saath dikh rahe the).
+    # Catalog bhi isi ke hisaab se filter — bina key wale provider ke models
+    # kisi bhi tab me nahi dikhne chahiye.
+    active_names = {p["name"] for p in providers}
+    catalog = {k: v for k, v in MODEL_CATALOG.items() if k in active_names}
 
     return {
-        "catalog": MODEL_CATALOG,
+        "catalog": catalog,
         "managed": managed,
         "providers": providers,
         "default_model": rotator.default_model,
@@ -1026,6 +1023,9 @@ async def admin_providers(request: Request):
     # public view: keys ko mask karo (dashboard pe sirf count dikhega)
     public = []
     for p in custom:
+        # rule: bina API key wale providers kisi bhi tab me nahi dikhte
+        if not p.get("api_keys"):
+            continue
         public.append(
             {
                 "name": p.get("name"),
@@ -1184,6 +1184,81 @@ async def admin_rotate_enc_key(request: Request):
 # --------------------------------------------------------------------------
 # Main LLM gateway (with per-user quota)
 # --------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# SSE streaming (`stream: true`)
+#
+# BUG FIX: pehle `stream: true` sirf "accepted for compatibility" tha —
+# server hamesha ek normal `application/json` body wapas bhejta tha, kabhi
+# `text/event-stream` nahi. Isse do problems hoti thi:
+#
+#   1. Bade OpenAI-compatible clients (Open WebUI, LibreChat, SillyTavern,
+#      Chatbox, TypingMind, ...) `stream: true` bhejte hain aur seedha SSE
+#      parse karte hain — unko valid `data: {...}\n\n` frames na milne pe
+#      wo request hi fail/hang kar dete the (chahe model normal ho ya
+#      virtual group jaisa "levelup").
+#   2. LevelUp app khud bhi pehle `stream: true` try karta hai aur SSE
+#      parser ko 0 chunks milte the → wo chup-chaap non-stream call se
+#      dobara try karta tha (fallback). Matlab HAR message ke liye do
+#      real upstream calls (Gemini) ho rahi thi — quota/RPM DOUBLE use ho
+#      raha tha 9 keys hone ke bawajood bhi "sab kaam nahi karte" isi wajah
+#      se lagta tha.
+#
+# Fix: rotation/fallback/group logic bilkul same rehta hai (poora result
+# pehle hi mil chuka hota hai, jaise non-stream path me) — bas response ko
+# proper OpenAI-style SSE frames me chunk karke bhejte hain. Isse dono
+# problems fix ho jaati hain, bina rotator/provider logic chhede.
+# ------------------------------------------------------------------
+def _sse_text_chunks(text: str, words_per_chunk: int = 3) -> list[str]:
+    """Text ko typing-effect ke liye chhote pieces me todta hai.
+    Whitespace bilkul preserve hota hai (koi word split nahi hota)."""
+    if not text:
+        return []
+    parts = re.findall(r"\S+\s*", text)
+    if not parts:
+        return [text]
+    return ["".join(parts[i : i + words_per_chunk]) for i in range(0, len(parts), words_per_chunk)]
+
+
+async def _stream_chat_completion(result, req: "ChatCompletionRequest"):
+    """Ek complete ChatResult ko OpenAI-compatible SSE chunk stream me convert karta hai."""
+    created = int(time.time())
+    base = {
+        "id": "chatcmpl-rotator",
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": result.model,
+    }
+
+    def frame(delta: dict, finish_reason: Optional[str] = None) -> str:
+        payload = {
+            **base,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    # 1. role chunk — clients isi se assistant message shuru karte hain
+    yield frame({"role": "assistant", "content": ""})
+
+    # 2. tool_calls (agar hain) — ek hi chunk me poora bhej dete hain
+    #    (true incremental function-call streaming abhi support nahi hai,
+    #    par clients ko poora tool_calls array milte hi kaam ho jata hai)
+    if result.tool_calls:
+        yield frame({"tool_calls": result.tool_calls})
+
+    # 3. content — chhote-chhote pieces me (typing effect)
+    for piece in _sse_text_chunks(result.text):
+        yield frame({"content": piece})
+        await asyncio.sleep(0.01)
+
+    # 4. reasoning (agar hai)
+    if result.reasoning_content:
+        yield frame({"reasoning_content": result.reasoning_content})
+
+    # 5. finish chunk
+    yield frame({}, finish_reason="tool_calls" if result.tool_calls else "stop")
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     rotator: Rotator = request.app.state.rotator
@@ -1293,6 +1368,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         gm.get("groundingChunks") or gm.get("webSearchQueries") or gm.get("searchEntryPoint")
     )
     ws_queries = gm.get("webSearchQueries") or []
+
+    if req.stream:
+        return StreamingResponse(
+            _stream_chat_completion(result, req),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # nginx/reverse-proxy buffering off
+            },
+        )
 
     return JSONResponse(
         content={

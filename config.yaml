@@ -5,6 +5,7 @@
 #    GEMINI_KEYS="key1,key2,key3"
 #    GROQ_KEYS="key1,key2"
 #    OPENROUTER_KEYS="key1"
+#    NVIDIA_KEYS="key1,key2"
 #    ZEN_KEYS="key1"
 #  Config me placeholder chhod do, env var override kar dega.
 # ============================================================
@@ -51,6 +52,24 @@ providers:
       # - deepseek/deepseek-r1:free
     api_keys:
       - "PASTE_OPENROUTER_KEY_1"
+
+  # ---------- NVIDIA NIM (build.nvidia.com — 1000 free credits) ----------
+  # OpenAI-compatible (vLLM backed), full model catalog: 189+ models.
+  # Key: build.nvidia.com se free nvapi-... key (1000 credits signup pe).
+  # Env override: NVIDIA_KEYS="key1,key2" (Render secret me daal do).
+  # Live models dashboard me "Refresh Live Models" se fetch hote hain.
+  - name: nvidia
+    type: openai
+    base_url: https://integrate.api.nvidia.com/v1
+    models:
+      - meta/llama-3.3-70b-instruct                # flagship llama — solid quality
+      - meta/llama-3.1-8b-instruct                 # fast + cheap
+      - openai/gpt-oss-120b                        # OpenAI open-weights
+      - z-ai/glm-5.2                               # GLM 5.2 — strong chat
+      - moonshotai/kimi-k2.6                       # Kimi K2.6
+      - deepseek-ai/deepseek-coder-6.7b-instruct   # coding specialist
+    api_keys:
+      - "PASTE_NVIDIA_KEY_1"
 
   # ---------- OPENCODE ZEN (opencode.ai — OpenAI-compatible gateway) ----------
   # Key env var se: ZEN_KEYS="sk-..." (Render secret / local env). Config me
