@@ -2804,7 +2804,7 @@ async function saveProviderAdmin(idx) {
     type: p.type,
     base_url: document.getElementById('prov-base-' + idx).value.trim(),
     models: document.getElementById('prov-models-' + idx).value.split(',').map(s => s.trim()).filter(Boolean),
-    api_keys: document.getElementById('prov-keys-' + idx).value.split('\n').map(s => s.trim()).filter(Boolean),
+    api_keys: document.getElementById('prov-keys-' + idx).value.split('\\n').map(s => s.trim()).filter(Boolean),
     enabled: document.getElementById('prov-enabled-' + idx).checked,
     replace_keys: document.getElementById('prov-replace-' + idx).checked,
   };
