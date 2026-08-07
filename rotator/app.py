@@ -930,6 +930,64 @@ def _default_base_url(ptype: str) -> str:
     return ""
 
 
+# --------------------------------------------------------------------------
+# Provider presets — "+ Add Provider" picker ke liye.
+#
+# Naya provider add karte waqt UI me sirf ek provider SELECT karna hota hai —
+# base_url + models yahi se auto-fill hote hain, aur API keys kabhi type nahi
+# karni padti: woh <NAME>_KEYS env var (ya config.yaml) se seedha detect hoti
+# hain (dekho _env_keys_for_name aur admin_add_provider ka fallback).
+# Ek hi base_url pe jitni bhi keys env var me comma-separated ho, sab
+# automatically round-robin rotate hoti hain (router.py KeyRing) — isliye
+# "kitne bhi apikeys ek baseurl pe" already built-in hai, UI me kuch extra
+# nahi karna padta.
+# --------------------------------------------------------------------------
+PROVIDER_PRESETS: dict[str, dict] = {
+    "gemini": {
+        "label": "Google Gemini",
+        "icon": "✨",
+        "type": "gemini",
+        "base_url": GEMINI_V1,
+    },
+    "groq": {
+        "label": "Groq",
+        "icon": "⚡",
+        "type": "openai",
+        "base_url": "https://api.groq.com/openai/v1",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "icon": "🌐",
+        "type": "openai",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "nvidia": {
+        "label": "NVIDIA NIM",
+        "icon": "🟩",
+        "type": "openai",
+        "base_url": "https://integrate.api.nvidia.com/v1",
+    },
+    "zen": {
+        "label": "OpenCode Zen",
+        "icon": "🧘",
+        "type": "openai",
+        "base_url": "https://opencode.ai/zen/v1",
+    },
+}
+
+
+def _env_keys_for_name(name: str) -> list[str]:
+    """<NAME>_KEYS env var se comma-separated keys nikaalo (PASTE_ placeholders skip).
+
+    Yehi function poore "Add Provider" flow ka core hai — UI kabhi bhi key
+    paste karne ka input nahi dikhati, sirf yahan se detect hoti hain.
+    """
+    env_name = f"{name.strip().upper()}_KEYS"
+    raw = os.environ.get(env_name, "")
+    keys = [k.strip() for k in raw.split(",") if k.strip()]
+    return [k for k in keys if not k.startswith("PASTE_")]
+
+
 def _live_cache(request: Request) -> dict:
     cache = getattr(request.app.state, "live_models_cache", None)
     if cache is None:
@@ -1036,6 +1094,101 @@ def _live_models_for_list(request: Request) -> list[dict]:
 # --------------------------------------------------------------------------
 # Custom providers admin endpoints (dashboard se add/remove)
 # --------------------------------------------------------------------------
+@app.get("/admin/providers/catalog")
+async def admin_providers_catalog(request: Request):
+    """"+ Add Provider" picker ke liye known presets.
+
+    Har preset ka base_url + default models bhi milte hain, aur env var
+    (`<NAME>_KEYS`) me kitni keys detect hui unka count bhi — taaki UI
+    keys ka koi input dikhaye bina "N keys detected" seedha dikha sake.
+    """
+    await _require_admin(request)
+    rotator: Rotator = request.app.state.rotator
+    existing_names = {st.cfg.name for st in rotator.providers}
+    custom = await database.list_custom_providers()
+    existing_names |= {p.get("name") for p in custom if p.get("name")}
+
+    presets = []
+    for name, meta in PROVIDER_PRESETS.items():
+        env_keys = _env_keys_for_name(name)
+        presets.append(
+            {
+                "name": name,
+                "label": meta["label"],
+                "icon": meta["icon"],
+                "type": meta["type"],
+                "base_url": meta["base_url"],
+                "models": MODEL_CATALOG.get(name, []),
+                "env_var": f"{name.upper()}_KEYS",
+                "env_key_count": len(env_keys),
+                "already_added": name in existing_names,
+            }
+        )
+    return {"presets": presets}
+
+
+@app.get("/admin/providers/detect-keys")
+async def admin_detect_keys(name: str, request: Request):
+    """Custom/manual provider name ke liye env keys live-detect karo.
+
+    "Add Provider" modal me "Custom / Other" choose karne pe, admin naam
+    type karta hai aur yeh endpoint <NAME>_KEYS env var check karke keys
+    ka count + masked preview deta hai — koi key kabhi type nahi karni.
+    """
+    await _require_admin(request)
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    keys = _env_keys_for_name(name)
+    return {
+        "name": name,
+        "env_var": f"{name.upper()}_KEYS",
+        "key_count": len(keys),
+        "previews": [_key_preview(k) for k in keys],
+    }
+
+
+@app.post("/admin/providers/{name}/resync-keys")
+async def admin_resync_provider_keys(name: str, request: Request):
+    """Provider ki keys `<NAME>_KEYS` env var se dobara pull karo.
+
+    Env var me baad me aur keys add karo (comma-separated) toh yahan se
+    resync karke woh naya set turant rotation me aa jaata hai — UI me
+    kabhi kisi key ko haath se paste nahi karna padta.
+    """
+    await _require_admin(request)
+    name = name.strip()
+    env_keys = _env_keys_for_name(name)
+    if not env_keys:
+        raise HTTPException(
+            status_code=404,
+            detail=f"'{name.upper()}_KEYS' env var me koi key nahi mili",
+        )
+
+    rotator: Rotator = request.app.state.rotator
+    existing = await database.get_custom_provider(name)
+    if existing:
+        provider = dict(existing)
+        provider["api_keys"] = env_keys
+        provider["selected_keys"] = []  # purane indices ab invalid ho sakte — reset
+        # key_base_urls purani keys ko refer karta tha, naye set pe map nahi hoga
+        provider["key_base_urls"] = {
+            k: v for k, v in (provider.get("key_base_urls") or {}).items() if k in env_keys
+        }
+        await database.upsert_custom_provider(provider)
+        custom = await database.list_custom_providers()
+        rotator.apply_custom_providers(custom)
+        return {"ok": True, "message": f"'{name}' ki keys env se resync ho gayi", "key_count": len(env_keys)}
+
+    # config.yaml wala provider — uska runtime state boot ke waqt hi env
+    # se ban chuka hota hai, isliye alag se sync ki zaroorat nahi.
+    return {
+        "ok": True,
+        "message": f"'{name}' config.yaml se manage hota hai — env keys already applied hain",
+        "key_count": len(env_keys),
+    }
+
+
 @app.get("/admin/providers")
 async def admin_providers(request: Request):
     """Providers ka editor view — config.yaml wale + custom wale DONO.
@@ -1221,6 +1374,11 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
     else:
         # custom nahi hai → runtime (config/env) keys preserve karo
         old_keys = [k for k in runtime_cfg["keys"] if not k.startswith("PASTE_")]
+        if not old_keys:
+            # bilkul naya provider (config.yaml me bhi nahi) — seedha
+            # <NAME>_KEYS env var se keys pull karo. "Add Provider" UI
+            # kabhi api_keys nahi bhejti, isliye yehi asli source hai.
+            old_keys = _env_keys_for_name(name)
     if req.replace_keys:
         keys = new_keys
     elif new_keys:
@@ -2145,13 +2303,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="view" id="view-providers">
       <div class="card">
         <h3 style="margin-bottom:4px">🔌 Provider Settings</h3>
-        <div class="muted" style="margin-bottom:10px">API keys sirf <b>env secrets</b> se aati hain (<b>GEMINI_KEYS</b>, <b>GROQ_KEYS</b>, <b>OPENROUTER_KEYS</b>, <b>NVIDIA_KEYS</b>, <b>ZEN_KEYS</b>) — yahan UI se keys add nahi hoti. Detected env keys yahan dikhti hain aur inhi ka <b>base_url</b> (provider-wide ya har key ka apna) set kar sakte ho — bina config.yaml chhede. Custom gateway (Cloudflare Worker etc.) ka URL daalo. 💾 Save ke baad live apply hota hai.</div>
+        <div class="muted" style="margin-bottom:10px">API keys sirf <b>env secrets</b> se aati hain (<b>GEMINI_KEYS</b>, <b>GROQ_KEYS</b>, <b>OPENROUTER_KEYS</b>, <b>NVIDIA_KEYS</b>, <b>ZEN_KEYS</b>, ...) — yahan UI me kabhi key type/paste nahi karni padti. "+ Add Provider" se ek provider select karo, base_url + detected keys apne aap dikh jayenge. Ek base_url pe env var me jitni bhi keys comma-separated ho, sab automatically rotate hoti hain. 💾</div>
         <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" onclick="openAddProviderModal()">➕ Add Provider</button>
           <button class="btn sec" onclick="refreshProvidersLive()">🔄 Refresh Live Models</button>
         </div>
         <div class="err" id="providers-err"></div>
         <div class="ok" id="providers-ok"></div>
         <div id="providers-list"><span class="muted">Loading…</span></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ADD PROVIDER MODAL -->
+<div class="modal" id="addProviderModal" style="display:none">
+  <div class="modal-box">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+      <h3 style="margin:0" id="addProviderTitle">➕ Add Provider</h3>
+      <button class="btn sec" onclick="closeAddProviderModal()">✕</button>
+    </div>
+
+    <!-- STEP 1: pick a provider -->
+    <div id="addProviderStep1">
+      <div class="muted" style="margin-bottom:10px">Provider select karo — base_url aur configured keys apne aap load ho jayengi.</div>
+      <div id="addProviderPresets"><span class="muted">Loading…</span></div>
+    </div>
+
+    <!-- STEP 2: confirm + save (no key input anywhere — auto-detected only) -->
+    <div id="addProviderStep2" style="display:none">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <button class="btn sec" onclick="backToProviderPresets()">‹ Back</button>
+        <b id="ap-name-label" style="font-size:15px"></b>
+        <span class="badge" id="ap-type-badge" style="background:var(--panel2);padding:2px 8px;border-radius:10px;font-size:12px"></span>
+      </div>
+
+      <div id="ap-custom-name-wrap" style="display:none">
+        <label>Provider name (env var: <span id="ap-custom-envname" class="muted"></span>)</label>
+        <input id="ap-custom-name" type="text" placeholder="jaise: cerebras" oninput="onCustomProviderNameInput()">
+        <label>Type</label>
+        <select id="ap-custom-type" onchange="onCustomProviderTypeChange()" style="width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:12px">
+          <option value="openai">openai (OpenAI-compatible /chat/completions)</option>
+          <option value="gemini">gemini (Google Gemini API)</option>
+        </select>
+      </div>
+
+      <label>Base URL</label>
+      <input id="ap-base-url" type="text" placeholder="https://...">
+
+      <div class="ok" id="ap-keys-status" style="margin-top:10px"></div>
+      <div class="err" id="ap-keys-err"></div>
+
+      <label>Models</label>
+      <div id="ap-models" class="model-list"></div>
+      <input id="ap-models-custom" type="text" placeholder="ya comma-separated model ids yahan daalo (custom provider)" style="margin-top:8px;display:none">
+
+      <div style="margin-top:12px"><span class="muted" style="font-size:12px"><input id="ap-enabled" type="checkbox" checked> enabled</span></div>
+
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+        <button class="btn sec" onclick="closeAddProviderModal()">Cancel</button>
+        <button class="btn" id="ap-submit-btn" onclick="submitNewProvider()">✅ Add Provider</button>
       </div>
     </div>
   </div>
@@ -2872,6 +3083,7 @@ function renderProviders() {
       <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <span class="muted" style="font-size:12px"><input id="prov-enabled-${idx}" type="checkbox" ${p.enabled ? 'checked' : ''}> enabled</span>
         <button class="btn" onclick="saveProviderAdmin(${idx}, ${JSON.stringify(p.name).replace(/"/g, '&quot;')})">💾 Save</button>
+        <button class="btn sec" onclick="resyncProviderKeys(${JSON.stringify(p.name).replace(/"/g, '&quot;')})" title="${p.name.toUpperCase()}_KEYS env var se dobara keys pull karo">🔁 Sync keys from env</button>
         ${isCustom ? `<button class="btn sec" onclick="deleteProviderAdmin(${JSON.stringify(p.name).replace(/"/g, '&quot;')})">🗑 Delete</button>` : ''}
       </div>
       <div style="margin-top:6px">${keyRows}</div>
@@ -2921,6 +3133,137 @@ async function refreshProvidersLive() {
   const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Refresh failed'; return; }
   document.getElementById('providers-ok').textContent = '✅ Live models refresh ho gaye';
+  await loadProvidersAdmin();
+}
+async function resyncProviderKeys(name) {
+  document.getElementById('providers-err').textContent = '';
+  document.getElementById('providers-ok').textContent = '';
+  const { res, data } = await api('/admin/providers/' + encodeURIComponent(name) + '/resync-keys', { method: 'POST' });
+  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Resync failed'; return; }
+  document.getElementById('providers-ok').textContent = '✅ ' + data.message + ' · ' + data.key_count + ' keys';
+  await loadProvidersAdmin();
+}
+
+// ---------- add provider modal (select provider → base_url + keys auto-detected, no typing) ----------
+let apPresets = [];
+let apSelected = null;   // { name, type, base_url, models, env_var, isCustom }
+
+function openAddProviderModal() {
+  document.getElementById('addProviderModal').style.display = 'flex';
+  document.getElementById('addProviderStep1').style.display = '';
+  document.getElementById('addProviderStep2').style.display = 'none';
+  loadProviderCatalogPicker();
+}
+function closeAddProviderModal() {
+  document.getElementById('addProviderModal').style.display = 'none';
+}
+function backToProviderPresets() {
+  document.getElementById('addProviderStep1').style.display = '';
+  document.getElementById('addProviderStep2').style.display = 'none';
+}
+async function loadProviderCatalogPicker() {
+  const box = document.getElementById('addProviderPresets');
+  box.innerHTML = '<span class="muted">Loading…</span>';
+  const { res, data } = await api('/admin/providers/catalog');
+  if (!res.ok) { box.innerHTML = '<span class="err">' + (data.detail || 'Load failed') + '</span>'; return; }
+  apPresets = data.presets || [];
+  box.innerHTML = apPresets.map((p, i) => `
+    <div class="pick-item" onclick="selectProviderPreset(${i})">
+      <span style="font-size:16px">${p.icon}</span>
+      <span class="id">${p.label} <span class="muted">(${p.env_var})</span></span>
+      ${p.already_added ? '<span class="tag">already added</span>' : (p.env_key_count > 0 ? `<span class="tag" style="color:var(--accent2)">${p.env_key_count} key${p.env_key_count === 1 ? '' : 's'} detected</span>` : '<span class="tag">no keys yet</span>')}
+    </div>`).join('') + `
+    <div class="pick-item" onclick="selectCustomProviderPreset()">
+      <span style="font-size:16px">🧩</span>
+      <span class="id">Custom / Other provider <span class="muted">(OpenAI-compatible gateway)</span></span>
+    </div>`;
+}
+function selectProviderPreset(i) {
+  const p = apPresets[i];
+  apSelected = { name: p.name, type: p.type, base_url: p.base_url, models: p.models, env_var: p.env_var, isCustom: false };
+  document.getElementById('ap-custom-name-wrap').style.display = 'none';
+  document.getElementById('ap-models-custom').style.display = 'none';
+  document.getElementById('ap-name-label').textContent = p.icon + ' ' + p.label;
+  document.getElementById('ap-type-badge').textContent = p.type;
+  document.getElementById('ap-base-url').value = p.base_url;
+  renderAddProviderModels(p.models, []);
+  refreshDetectedKeys(p.name, p.env_var);
+  document.getElementById('addProviderStep1').style.display = 'none';
+  document.getElementById('addProviderStep2').style.display = '';
+}
+function selectCustomProviderPreset() {
+  apSelected = { name: '', type: 'openai', base_url: '', models: [], env_var: '', isCustom: true };
+  document.getElementById('ap-custom-name-wrap').style.display = '';
+  document.getElementById('ap-custom-name').value = '';
+  document.getElementById('ap-custom-type').value = 'openai';
+  document.getElementById('ap-models-custom').style.display = '';
+  document.getElementById('ap-models-custom').value = '';
+  document.getElementById('ap-name-label').textContent = '🧩 Custom Provider';
+  document.getElementById('ap-type-badge').textContent = 'openai';
+  document.getElementById('ap-base-url').value = '';
+  document.getElementById('ap-custom-envname').textContent = '—';
+  renderAddProviderModels([], []);
+  document.getElementById('ap-keys-status').textContent = '';
+  document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.';
+  document.getElementById('addProviderStep1').style.display = 'none';
+  document.getElementById('addProviderStep2').style.display = '';
+}
+function onCustomProviderTypeChange() {
+  document.getElementById('ap-type-badge').textContent = document.getElementById('ap-custom-type').value;
+}
+let apCustomNameDebounce = null;
+function onCustomProviderNameInput() {
+  const name = document.getElementById('ap-custom-name').value.trim();
+  document.getElementById('ap-custom-envname').textContent = name ? (name.toUpperCase() + '_KEYS') : '—';
+  clearTimeout(apCustomNameDebounce);
+  if (!name) { document.getElementById('ap-keys-status').textContent = ''; document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.'; return; }
+  apCustomNameDebounce = setTimeout(() => refreshDetectedKeys(name, name.toUpperCase() + '_KEYS'), 350);
+}
+async function refreshDetectedKeys(name, envVar) {
+  const okEl = document.getElementById('ap-keys-status');
+  const errEl = document.getElementById('ap-keys-err');
+  okEl.textContent = '🔍 checking ' + envVar + '…';
+  errEl.textContent = '';
+  const { res, data } = await api('/admin/providers/detect-keys?name=' + encodeURIComponent(name));
+  if (!res.ok) { okEl.textContent = ''; errEl.textContent = data.detail || 'Key detection failed'; return; }
+  if (data.key_count > 0) {
+    okEl.textContent = `✅ ${data.key_count} key${data.key_count === 1 ? '' : 's'} detected from ${data.env_var} (${data.previews.join(', ')}) — sab ek hi base_url pe rotate hongi.`;
+  } else {
+    okEl.textContent = '';
+    errEl.textContent = `⚠️ ${data.env_var} me koi key nahi mili. Host secrets me "${data.env_var}=key1,key2,..." add karke (multiple keys ek saath) dobara try karo.`;
+  }
+}
+function renderAddProviderModels(models, checkedList) {
+  const box = document.getElementById('ap-models');
+  const checked = new Set(checkedList.length ? checkedList : models);
+  box.innerHTML = models.map(m => `
+    <label class="chip ${checked.has(m) ? 'checked' : ''}">
+      <input type="checkbox" value="${m.replace(/"/g, '&quot;')}" checked onchange="this.parentElement.classList.toggle('checked', this.checked)">
+      ${m}
+    </label>`).join('') || '<span class="muted">Koi default model nahi — neeche custom model ids daalo.</span>';
+}
+async function submitNewProvider() {
+  document.getElementById('ap-keys-err').textContent = '';
+  let name = apSelected.isCustom ? document.getElementById('ap-custom-name').value.trim() : apSelected.name;
+  const type = apSelected.isCustom ? document.getElementById('ap-custom-type').value : apSelected.type;
+  const base_url = document.getElementById('ap-base-url').value.trim();
+  if (!name) { document.getElementById('ap-keys-err').textContent = 'Provider name required'; return; }
+  let models = Array.from(document.querySelectorAll('#ap-models input[type=checkbox]:checked')).map(i => i.value);
+  if (apSelected.isCustom) {
+    const extra = document.getElementById('ap-models-custom').value.split(',').map(s => s.trim()).filter(Boolean);
+    models = models.concat(extra);
+  }
+  if (!models.length) { document.getElementById('ap-keys-err').textContent = 'Kam se kam ek model chahiye'; return; }
+  const enabled = document.getElementById('ap-enabled').checked;
+  const btn = document.getElementById('ap-submit-btn');
+  btn.disabled = true; btn.textContent = 'Adding…';
+  // NOTE: api_keys jaan-bujhke nahi bheja — backend seedha <NAME>_KEYS env var
+  // se keys pull karta hai. UI me kabhi key type/paste nahi hoti.
+  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify({ name, type, base_url, models, enabled }) });
+  btn.disabled = false; btn.textContent = '✅ Add Provider';
+  if (!res.ok) { document.getElementById('ap-keys-err').textContent = data.detail || 'Add failed'; return; }
+  document.getElementById('providers-ok').textContent = '✅ ' + data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
+  closeAddProviderModal();
   await loadProvidersAdmin();
 }
 
