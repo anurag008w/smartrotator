@@ -136,17 +136,36 @@ def _read_json(path: Path, default):
     try:
         text = path.read_text(encoding="utf-8")
         # Duplicate JSON keys = file corrupt/merge hui thi (usage.json me yeh
-        # dekha hai). Last-wins (Python default), par warning do taaki pata
-        # chale — aur aisi file dobara se push na ho.
+        # dekha hai — int/str key mismatch se dono versions write ho gaye the).
+        # Naive last-wins = purana usage data permanently lost. Isliye:
+        #   - nested dicts (usage: {user: {day: {requests, tokens}}}) → DEEP-MERGE
+        #   - scalar/list → last-wins
+        # Taaki purana data preserve ho aur naya bhi na chhute.
+        def _deep_merge(a: dict, b: dict) -> dict:
+            out = dict(a)
+            for k, v in b.items():
+                if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+                    out[k] = _deep_merge(out[k], v)
+                else:
+                    out[k] = v
+            return out
+
         def _pairs_hook(pairs):
             d = {}
             for k, v in pairs:
-                if k in d:
+                if k in d and isinstance(d[k], dict) and isinstance(v, dict):
                     logger.warning(
-                        "store: %s duplicate key '%s' — last wins (file repair karo)",
+                        "store: %s duplicate key '%s' — deep merged (purana data preserve)",
                         path.name, k,
                     )
-                d[k] = v
+                    d[k] = _deep_merge(d[k], v)
+                else:
+                    if k in d:
+                        logger.warning(
+                            "store: %s duplicate key '%s' — last wins (file repair karo)",
+                            path.name, k,
+                        )
+                    d[k] = v
             return d
         return json.loads(text, object_pairs_hook=_pairs_hook)
     except (json.JSONDecodeError, OSError) as exc:
@@ -276,7 +295,27 @@ async def init_db() -> None:
         _apply_pending_migrations_locked()
 
         _usage.clear()
-        _usage.update(_read_json(USAGE_FILE, {}))
+        raw_usage = _read_json(USAGE_FILE, {})
+        # Corrupt/odd type (list, string, etc.) se koi bhi tool aaya ho —
+        # crash mat karo, empty usage se continue (init_db kabhi fail na ho,
+        # warna /health 503 → Render restart-loop).
+        if not isinstance(raw_usage, dict):
+            logger.warning(
+                "store: usage.json unexpected type %s — usage reset (empty)",
+                type(raw_usage).__name__,
+            )
+            raw_usage = {}
+        # JSON round-trip pe dict keys hamesha STRING hote hain ("1"), par
+        # runtime me `_usage` int keys expect karta hai (user_id). Bina
+        # normalize kiye restart pe saara usage lookup miss hota hai → 0
+        # dikhta hai, aur naya write int-key add kar deta hai → duplicate
+        # JSON keys ban jaati hain. Yahan pe load time pe fix karo.
+        for k, v in raw_usage.items():
+            try:
+                uid = int(k)
+            except (TypeError, ValueError):
+                uid = k
+            _usage[uid] = v
 
         _managed.clear()
         m = _read_json(MANAGED_FILE, None)
@@ -622,7 +661,24 @@ async def record_tokens(user_id: int, day: str, tokens: int) -> None:
 
 
 def _persist_usage_locked() -> None:
-    _write_json(USAGE_FILE, _usage)
+    # Safety: _usage me int + string keys dono kabhi ho jayein (purani
+    # corrupt files se) — JSON dump pe dono "1" ban kar duplicate keys
+    # banate hain aur agla load purana data kha jata hai. Write se pehle
+    # saari keys ko int normalize karo (merge kar ke).
+    norm: dict[int, dict[str, dict]] = {}
+    for k, v in _usage.items():
+        try:
+            uid = int(k)
+        except (TypeError, ValueError):
+            uid = k
+        if uid in norm and isinstance(norm[uid], dict) and isinstance(v, dict):
+            merged = dict(norm[uid])
+            for dk, dv in v.items():
+                merged[dk] = dv
+            norm[uid] = merged
+        else:
+            norm[uid] = v
+    _write_json(USAGE_FILE, norm)
 
 
 # --------------------------------------------------------------------------

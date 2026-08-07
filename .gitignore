@@ -16,6 +16,9 @@ data/*
 !data/*.json
 !data/sync/
 !data/sync/**
+data/.*
+data/.jwt-secret
+data/.enc-key
 test_data_*/
 *.tmp
 .corrupt-*

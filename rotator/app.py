@@ -1259,6 +1259,33 @@ async def _stream_chat_completion(result, req: "ChatCompletionRequest"):
     yield "data: [DONE]\n\n"
 
 
+def _sse_error_response(detail: str, code: int = 503) -> StreamingResponse:
+    """Streaming request pe error OpenAI-style SSE frame me bhejo.
+
+    LevelUp jaise SSE parsers non-200 response ko sirf "SSE HTTP 503" jaise
+    generic text se handle karte hain — actual error message kabhi nahi
+    dikhta. Isliye jab client `stream: true` bhejta hai, provider error ko
+    `data: {"error": {...}}` + `[DONE]` frame (HTTP 200) me convert karte
+    hain. OpenAI-compatible clients ise error ki tarah parse karte hain.
+    """
+    payload = {
+        "error": {
+            "message": detail,
+            "type": "server_error",
+            "code": code,
+        }
+    }
+    return StreamingResponse(
+        iter([f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n"]),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     rotator: Rotator = request.app.state.rotator
@@ -1309,6 +1336,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         if user:
             await _refund_quota(user)
         logger.warning("chat: rate limited upstream: %s", exc)
+        if req.stream:
+            return _sse_error_response(
+                "Server abhi bahut load me hai, kuch minute baad try karo.", code=503
+            )
         raise HTTPException(
             status_code=503,
             detail="Server abhi bahut load me hai, kuch minute baad try karo.",
@@ -1318,23 +1349,26 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         if user:
             await _refund_quota(user)
         logger.error("chat: all providers exhausted: %s", exc)
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Something went wrong — saare AI providers abhi busy/ exhausted hain. "
-                "Thodi der baad try karo, ya apna configured provider use karo. "
-                "(sahi provider error `/status` ya admin panel me dikhta hai)"
-            ),
-        ) from exc
+        detail = (
+            "Something went wrong — saare AI providers abhi busy/ exhausted hain. "
+            "Thodi der baad try karo, ya apna configured provider use karo. "
+            "(sahi provider error `/status` ya admin panel me dikhta hai)"
+        )
+        if req.stream:
+            return _sse_error_response(detail, code=503)
+        raise HTTPException(status_code=503, detail=detail) from exc
     except ProviderError as exc:
         # koi aur provider error (config galat, network, etc.)
         if user:
             await _refund_quota(user)
         logger.error("chat: provider error: %s", exc)
         status_code = exc.status_code if exc.status_code else 502
+        detail = "Server ko AI provider se connect karne me problem aayi. Kuch minute baad try karo."
+        if req.stream:
+            return _sse_error_response(detail, code=status_code)
         raise HTTPException(
             status_code=status_code,
-            detail="Server ko AI provider se connect karne me problem aayi. Kuch minute baad try karo.",
+            detail=detail,
         ) from exc
 
     # record actual token usage
@@ -1355,9 +1389,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             result.provider,
             result.model,
         )
+        detail = "AI model ne khaali reply diya (saara token budget thinking me chala gaya). Thodi der baad try karo ya max_tokens badhao."
+        if req.stream:
+            return _sse_error_response(detail, code=502)
         raise HTTPException(
             status_code=502,
-            detail="AI model ne khaali reply diya (saara token budget thinking me chala gaya). Thodi der baad try karo ya max_tokens badhao.",
+            detail=detail,
         )
 
     # web search indicator — raw Gemini response se grounding check karo.
