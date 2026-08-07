@@ -283,9 +283,15 @@ class OpenAICompatibleProvider(Provider):
         response_format: Optional[dict] = None,
         seed: Optional[int] = None,
         logit_bias: Optional[dict] = None,
+        base_url: Optional[str] = None,   # per-key base_url override (optional)
     ) -> ChatResult:
         if not api_key:
             raise AuthError(f"{self.name}: no api key provided", retryable=False)
+
+        # per-key base_url override — is key ke liye alag gateway/proxy ho toh
+        endpoint = self.endpoint
+        if base_url:
+            endpoint = base_url.rstrip("/") + "/chat/completions"
 
         payload_messages = [self._to_openai_message(m) for m in messages]
         payload = {
@@ -329,7 +335,7 @@ class OpenAICompatibleProvider(Provider):
         client = self._proxy_client(proxy)
         try:
             http = client or self._client
-            resp = await http.post(self.endpoint, headers=headers, json=payload)
+            resp = await http.post(endpoint, headers=headers, json=payload)
             resp.raise_for_status()
             data = self._parse_json_response(resp, self.name)
             # kuch gateways 200 status pe hi error body bhej dete hain
@@ -459,6 +465,7 @@ class GeminiProvider(Provider):
         response_format: Optional[dict] = None,
         seed: Optional[int] = None,
         logit_bias: Optional[dict] = None,
+        base_url: Optional[str] = None,   # per-key base_url override (optional)
     ) -> ChatResult:
         if not api_key:
             raise AuthError("gemini: no api key provided", retryable=False)
@@ -504,6 +511,8 @@ class GeminiProvider(Provider):
             }
 
         url = f"{self.base_url}/models/{model}:generateContent"
+        if base_url:
+            url = base_url.rstrip("/") + f"/models/{model}:generateContent"
         headers = {"Content-Type": "application/json"}
         params = {"key": api_key}
 

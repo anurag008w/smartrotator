@@ -411,6 +411,8 @@ class CustomProviderInput(BaseModel):
     models: list[str] = Field([], max_length=100)
     enabled: bool = True
     replace_keys: bool = False    # true = purani keys hatake nayi lagao
+    key_base_urls: dict[str, str] = {}   # key -> us ka apna base_url (per-key)
+    selected_keys: list[int] = []        # existing keys me se select ki hui (indices)
 
 
 # --------------------------------------------------------------------------
@@ -1071,14 +1073,30 @@ async def admin_providers(request: Request):
                 "enabled": True,
                 "source": "runtime",
                 "key_count": len(st.cfg.keys),
-                "keys": [{"index": i, "preview": _key_preview(k)} for i, k in enumerate(st.cfg.keys)],
+                "keys": [
+                    {
+                        "index": i,
+                        "preview": _key_preview(k),
+                        "base_url": st.cfg.key_base_urls.get(k, ""),
+                        "selected": True,
+                    }
+                    for i, k in enumerate(st.cfg.keys)
+                ],
+                "key_base_urls": dict(st.cfg.key_base_urls),
             }
             config_providers[st.cfg.name] = entry
         else:
             entry["key_count"] = len(st.cfg.keys)
             entry["keys"] = [
-                {"index": i, "preview": _key_preview(k)} for i, k in enumerate(st.cfg.keys)
+                {
+                    "index": i,
+                    "preview": _key_preview(k),
+                    "base_url": st.cfg.key_base_urls.get(k, ""),
+                    "selected": True,
+                }
+                for i, k in enumerate(st.cfg.keys)
             ]
+            entry["key_base_urls"] = dict(st.cfg.key_base_urls)
             if st.cfg.base_url:
                 entry["base_url"] = st.cfg.base_url
 
@@ -1098,8 +1116,15 @@ async def admin_providers(request: Request):
             "enabled": p.get("enabled", True),
             "source": "custom",
             "key_count": len(p.get("api_keys", [])),
+            "key_base_urls": dict(p.get("key_base_urls") or {}),
+            "selected_keys": p.get("selected_keys") or [],
             "keys": [
-                {"index": i, "preview": _key_preview(k)}
+                {
+                    "index": i,
+                    "preview": _key_preview(k),
+                    "base_url": (p.get("key_base_urls") or {}).get(k, ""),
+                    "selected": i in (p.get("selected_keys") or []),
+                }
                 for i, k in enumerate(p.get("api_keys", []))
             ],
         }
@@ -1208,6 +1233,10 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
         "api_keys": keys,
         "models": models,
         "enabled": req.enabled,
+        # key_base_urls: {key: url} ya {index: url} dono accept — index wale ko resolve
+        "key_base_urls": _resolve_key_base_urls(req.key_base_urls, keys),
+        # selected_keys: sirf ye keys rotation me use hongi (empty = sab selected)
+        "selected_keys": [i for i in (req.selected_keys or []) if 0 <= i < len(keys)],
     }
     await database.upsert_custom_provider(provider)
 
@@ -1228,6 +1257,20 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
         "live": (entry or {}).get("models", []),
         "live_error": (entry or {}).get("error"),
     }
+
+
+def _resolve_key_base_urls(raw: dict, keys: list[str]) -> dict:
+    """Per-key base_url map resolve karo — {key: url} ya {index: url} dono chalta hai.
+    (UI index-based bhejta hai kyunki full keys plaintext return nahi hoti.)"""
+    out: dict[str, str] = {}
+    for kk, vv in (raw or {}).items():
+        if not vv:
+            continue
+        if kk.isdigit() and int(kk) < len(keys):
+            out[keys[int(kk)]] = vv.strip()
+        elif kk in keys:
+            out[kk] = vv.strip()
+    return out
 
 
 @app.delete("/admin/providers/{name}")
@@ -2764,7 +2807,14 @@ function renderProviders() {
   if (!list.length) { box.innerHTML = '<div class="muted">Koi provider nahi — config.yaml + API keys daalo.</div>'; return; }
   box.innerHTML = list.map((p, idx) => {
     const isCustom = p.source === 'custom';
-    const keyPreviews = (p.keys || []).map(k => '<code style="background:var(--panel2);padding:2px 5px;border-radius:4px;margin-right:6px">' + k.preview + '</code>').join('');
+    const keyRows = (p.keys || []).map((k, ki) => `
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+        <label style="display:flex;align-items:center;gap:4px;font-size:12px">
+          <input type="checkbox" id="prov-ksel-${idx}-${ki}" ${k.selected !== false ? 'checked' : ''} onchange="saveProviderKeys(${idx})">
+        </label>
+        <code style="background:var(--panel2);padding:2px 5px;border-radius:4px;font-size:12px">${k.preview}</code>
+        <input id="prov-kbase-${idx}-${ki}" type="text" value="${(k.base_url || '').replace(/"/g, '&quot;')}" placeholder="key ka apna base_url (optional)" style="width:auto;flex:1;min-width:160px;padding:5px;font-size:12px">
+      </div>`).join('');
     return `
     <div class="provider-card" style="border:1px solid var(--panel2);border-radius:10px;padding:14px;margin-bottom:12px;background:var(--bg)">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
@@ -2791,7 +2841,7 @@ function renderProviders() {
         <button class="btn" onclick="saveProviderAdmin(${idx}, ${JSON.stringify(p.name).replace(/"/g, '&quot;')})">💾 Save</button>
         ${isCustom ? `<button class="btn sec" onclick="deleteProviderAdmin(${JSON.stringify(p.name).replace(/"/g, '&quot;')})">🗑 Delete</button>` : ''}
       </div>
-      <div style="margin-top:6px">${keyPreviews}</div>
+      <div style="margin-top:6px">${keyRows}</div>
     </div>`;
   }).join('');
 }
@@ -2799,6 +2849,15 @@ async function saveProviderAdmin(idx) {
   const p = providersData.providers[idx];
   document.getElementById('providers-err').textContent = '';
   document.getElementById('providers-ok').textContent = '';
+  const keys = (p.keys || []);
+  const key_base_urls = {};
+  const selected_keys = [];
+  keys.forEach((k, ki) => {
+    const v = document.getElementById('prov-kbase-' + idx + '-' + ki);
+    const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
+    if (v && v.value.trim()) key_base_urls[String(ki)] = v.value.trim();
+    if (cb && cb.checked) selected_keys.push(ki);
+  });
   const body = {
     name: p.name,
     type: p.type,
@@ -2807,11 +2866,16 @@ async function saveProviderAdmin(idx) {
     api_keys: document.getElementById('prov-keys-' + idx).value.split('\\n').map(s => s.trim()).filter(Boolean),
     enabled: document.getElementById('prov-enabled-' + idx).checked,
     replace_keys: document.getElementById('prov-replace-' + idx).checked,
+    key_base_urls: key_base_urls,
+    selected_keys: selected_keys,
   };
   const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Save failed'; return; }
   document.getElementById('providers-ok').textContent = data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
   await loadProvidersAdmin();
+}
+function saveProviderKeys(idx) {
+  document.getElementById('providers-ok').textContent = '✅ keys updated (Save dabao to apply)';
 }
 async function deleteProviderAdmin(name) {
   if (!confirm('Delete provider "' + name + '"?')) return;

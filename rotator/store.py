@@ -737,6 +737,15 @@ def _providers_for_disk() -> list[dict]:
     for p in _custom_providers:
         row = dict(p)
         row["api_keys"] = [_encrypt_key(k) for k in (p.get("api_keys") or [])]
+        # per-key base_url map — keys encrypted hain toh index-based map rakho
+        kb = p.get("key_base_urls") or {}
+        if kb:
+            row["key_base_urls"] = {
+                str(idx): kb.get(k, "") for idx, k in enumerate(p.get("api_keys") or [])
+            }
+        # selected_keys preserve (already indices hain — encryption se unaffected)
+        if p.get("selected_keys"):
+            row["selected_keys"] = p["selected_keys"]
         out.append(row)
     return out
 
@@ -747,6 +756,16 @@ def _decrypt_providers(rows) -> list[dict]:
     for p in rows or []:
         row = dict(p)
         row["api_keys"] = [_decrypt_key(k) for k in (p.get("api_keys") or [])]
+        # index-based per-key base_url → key-based map (decrypt ke baad)
+        kb = p.get("key_base_urls") or {}
+        if kb:
+            row["key_base_urls"] = {
+                row["api_keys"][int(idx)]: v
+                for idx, v in kb.items()
+                if idx.isdigit() and int(idx) < len(row["api_keys"]) and v
+            }
+        if p.get("selected_keys"):
+            row["selected_keys"] = p["selected_keys"]
         out.append(row)
     return out
 

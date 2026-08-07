@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import random
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 
 import yaml
@@ -48,6 +48,7 @@ class ProviderConfig:
     models: list[str]
     keys: list[str]
     base_url: Optional[str] = None
+    key_base_urls: dict[str, str] = field(default_factory=dict)  # key -> us ka apna base_url
     rpm_limit: int = 0
     rpd_limit: int = 0
     web_search_passthrough: bool = False
@@ -201,6 +202,10 @@ class Rotator:
             ptype = cfg.get("type", "openai")
             models = [m.strip() for m in cfg.get("models", []) if m.strip()]
             keys = [k.strip() for k in cfg.get("api_keys", []) if k.strip() if not k.startswith("PASTE_")]
+            # selected_keys: sirf ye keys rotation me (dashboard checkbox se select)
+            sel = cfg.get("selected_keys") or []
+            if sel:
+                keys = [keys[i] for i in sel if 0 <= i < len(keys)]
             if not name or not keys or not models:
                 continue
             custom_states.append(
@@ -211,6 +216,7 @@ class Rotator:
                         models=models,
                         keys=keys,
                         base_url=cfg.get("base_url"),
+                        key_base_urls={k: v for k, v in (cfg.get("key_base_urls") or {}).items() if k in keys},
                         rpm_limit=int(cfg.get("rpm_limit", 0)),
                         rpd_limit=int(cfg.get("rpd_limit", 0)),
                         web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
@@ -337,6 +343,7 @@ class Rotator:
                     models=models,
                     keys=st.cfg.keys,
                     base_url=st.cfg.base_url,
+                    key_base_urls=st.cfg.key_base_urls,
                     rpm_limit=st.cfg.rpm_limit,
                     rpd_limit=st.cfg.rpd_limit,
                 )
@@ -533,6 +540,8 @@ class Rotator:
 
             proxy = self._pick_proxy()
             try:
+                # per-key base_url: is key ka apna gateway ho toh use karo
+                request_base_url = st.cfg.key_base_urls.get(state.key) or st.cfg.base_url
                 result = await st.provider.chat(
                     messages,
                     resolved_model,
@@ -549,6 +558,7 @@ class Rotator:
                     response_format=response_format,
                     seed=seed,
                     logit_bias=logit_bias,
+                    base_url=request_base_url,
                 )
                 ring.report_success(state, resolved_model)
                 ring.record_used(state)
