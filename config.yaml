@@ -19,12 +19,14 @@ rotation:
 
 providers:
   # ---------- GOOGLE GEMINI (best free tier: 1500 RPD, vision native) ----------
+  # Cloudflare Worker route: /gemini/v1beta → generativelanguage.googleapis.com/v1beta
+  #   base_url: https://<worker>.workers.dev/gemini/v1beta
   - name: gemini
     type: gemini
     # base_url OPTIONAL — default: https://generativelanguage.googleapis.com/v1beta
     # Custom gateway/proxy use karna ho (jaise Cloudflare Worker routing trick)
     # toh apna URL yahan daalo, ending "/v1beta" ke saath, e.g.:
-    #   base_url: https://your-worker.workers.dev/v1beta
+    #   base_url: https://your-worker.workers.dev/gemini/v1beta
     # ya direct googleapi alt-endpoint:
     #   base_url: https://generativelanguage.googleapis.com/v1beta
     models:
@@ -38,6 +40,8 @@ providers:
   # NOTE: Groq ke Gemma/Llama models pe native web search NAHI hai.
   # Web search sirf `groq/compound*` systems pe automatic (bina tools ke)
   # aur GPT-OSS pe `browser_search` tool se chalta hai.
+  # Cloudflare Worker route: /groq/openai/v1 → api.groq.com/openai/v1
+  #   base_url: https://<worker>.workers.dev/groq/openai/v1
   - name: groq
     type: openai
     base_url: https://api.groq.com/openai/v1
@@ -50,6 +54,8 @@ providers:
       - "PASTE_GROQ_KEY_1"
 
   # ---------- OPENROUTER (28+ free models, 50 RPD) ----------
+  # Cloudflare Worker route: /openrouter/api/v1 → openrouter.ai/api/v1
+  #   base_url: https://<worker>.workers.dev/openrouter/api/v1
   - name: openrouter
     type: openai
     base_url: https://openrouter.ai/api/v1
@@ -64,6 +70,8 @@ providers:
   # Key: build.nvidia.com se free nvapi-... key (1000 credits signup pe).
   # Env override: NVIDIA_KEYS="key1,key2" (Render secret me daal do).
   # Live models dashboard me "Refresh Live Models" se fetch hote hain.
+  # Cloudflare Worker route: /nvidia/v1 → integrate.api.nvidia.com/v1
+  #   base_url: https://<worker>.workers.dev/nvidia/v1
   - name: nvidia
     type: openai
     base_url: https://integrate.api.nvidia.com/v1
@@ -80,6 +88,8 @@ providers:
   # ---------- OPENCODE ZEN (opencode.ai — OpenAI-compatible gateway) ----------
   # Key env var se: ZEN_KEYS="sk-..." (Render secret / local env). Config me
   # kabhi real key mat daalo — repo PUBLIC hai!
+  # Cloudflare Worker route: /zen/v1 → opencode.ai/zen/v1
+  #   base_url: https://<worker>.workers.dev/zen/v1
   - name: zen
     type: openai
     base_url: https://opencode.ai/zen/v1
