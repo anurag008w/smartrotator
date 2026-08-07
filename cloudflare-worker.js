@@ -139,7 +139,11 @@ function buildBrowserHeaders(base) {
   h.set("User-Agent", fp.ua);
   h.set("Accept", "application/json, text/event-stream, text/plain, */*");
   h.set("Accept-Language", pick(LOCALES));
-  h.set("Accept-Encoding", "gzip, deflate, br");
+  // NOTE: Accept-Encoding intentionally set NAHI karte — Cloudflare Workers
+  // khud handle karta hai (upstream gzip ko transparently decompress karke
+  // client ke Accept-Encoding ke hisaab se re-compress). Manual gzip set
+  // karne pe response bina decompress pass hota hai aur bina Accept-Encoding
+  // wale clients ke liye toot sakta hai.
   h.set("sec-ch-ua", fp.brands);
   h.set("sec-ch-ua-mobile", fp.mobile);
   h.set("sec-ch-ua-platform", fp.platform);

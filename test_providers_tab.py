@@ -1,6 +1,6 @@
 """
 test_providers_tab.py — verifies "🔌 Providers" tab backend:
-- GET /admin/providers: config + custom providers merged (base_url, keys, models)
+- GET /admin/providers: config.yaml wale HIDDEN, sirf custom providers dikhte hain
 - POST /admin/providers: empty keys preserve, merge, replace_keys, base_url preserve
 - custom provider same-name wale config provider ko override karta hai (live)
 
@@ -87,18 +87,13 @@ def test_full_flow():
         tok = _register_and_promote_superadmin(client)
         h = {"Authorization": "Bearer " + tok}
 
-        # 1) GET — config + runtime provider base list
+        # 1) GET — config.yaml wale providers UI me NAHI dikhte (hidden)
         r = client.get("/admin/providers", headers=h)
         assert r.status_code == 200, r.text
-        provs = r.json()["providers"]
-        names = {p["name"] for p in provs}
-        assert "gemini" in names, provs
-        gem = next(p for p in provs if p["name"] == "gemini")
-        assert gem["key_count"] == 2, gem
-        assert any(k["preview"] for k in gem["keys"]), gem
-        assert "source" in gem, gem
+        names = {p["name"] for p in r.json()["providers"]}
+        assert "gemini" not in names, names
 
-        # 2) POST — base_url update karo (keys empty = preserve), merge
+        # 2) POST — naya custom provider add (base_url + keys + models)
         r = client.post("/admin/providers", headers=h, json={
             "name": "gemini",
             "type": "gemini",
@@ -108,7 +103,7 @@ def test_full_flow():
             "enabled": True,
         })
         assert r.status_code == 200, r.text
-        assert r.json()["key_count"] == 3, r.json()  # 2 existing + 1 new
+        assert r.json()["key_count"] == 3, r.json()  # 2 runtime config keys + 1 new
 
         # custom store me check
         r = client.get("/admin/providers", headers=h)
@@ -116,6 +111,7 @@ def test_full_flow():
         assert gem["base_url"] == "https://my-worker.workers.dev/v1beta", gem
         assert gem["key_count"] == 3, gem
         assert gem["source"] == "custom", gem
+        assert any(k["preview"] for k in gem["keys"]), gem
 
         # 3) replace_keys = true — purani hatake nayi
         r = client.post("/admin/providers", headers=h, json={
@@ -136,13 +132,12 @@ def test_full_flow():
         assert gem["base_url"] == "https://my-worker.workers.dev/v1beta", gem
         assert gem["models"] == ["gemini-2.5-flash"], gem
 
-        # 5) delete custom — wapas config default
+        # 5) delete custom — config default (hidden) wapas, list se gayab
         r = client.delete("/admin/providers/gemini", headers=h)
         assert r.status_code == 200, r.text
         provs = client.get("/admin/providers", headers=h).json()["providers"]
-        gem = next(p for p in provs if p["name"] == "gemini")
-        assert gem["source"] == "config", gem
-        assert gem["key_count"] == 2, gem  # env keys wapas (config ke)
+        names = {p["name"] for p in provs}
+        assert "gemini" not in names, names
         return True
 
 

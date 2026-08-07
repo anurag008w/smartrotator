@@ -1135,6 +1135,9 @@ async def admin_providers(request: Request):
         config_providers[n] for n in all_names if n not in custom_names
     ] + [config_providers[n] for n in all_names if n in custom_names]
 
+    # sirf dashboard-se-managed providers dikhao — config.yaml ke defaults hide
+    ordered = [p for p in ordered if p.get("source") != "config"]
+
     cache = _live_cache(request)
     status = []
     for name, entry in cache.items():
@@ -2112,6 +2115,45 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="card">
         <h3 style="margin-bottom:4px">🔌 Provider Settings</h3>
         <div class="muted" style="margin-bottom:10px">Har provider ka <b>base_url</b> + jitni chaaho <b>API keys</b> yahan se set karo — bina config.yaml chhede. Keys <b>add/merge</b> hoti hain (purani delete karne ke liye 🗑 provider delete karke dobara banao). Custom gateway (Cloudflare Worker etc.) ka URL yahan daalo — saare providers ke liye chalta hai. 💾 Save ke baad live apply hota hai.</div>
+        <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" onclick="toggleAddProvider()" id="add-provider-toggle">➕ Add Provider</button>
+          <button class="btn sec" onclick="refreshProvidersLive()">🔄 Refresh Live Models</button>
+        </div>
+        <div id="add-provider-form" style="display:none;border:1px solid var(--panel2);border-radius:10px;padding:14px;margin-bottom:14px;background:var(--bg)">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+            <b>New Provider</b>
+            <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:4px"><input id="ap-enabled" type="checkbox" checked> enabled</label>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <label class="muted" style="font-size:12px">Provider
+              <select id="ap-provider" onchange="onAddProviderPick()" style="width:100%;margin-top:4px">
+                <option value="">— select provider —</option>
+                <option value="gemini">gemini</option>
+                <option value="groq">groq</option>
+                <option value="openrouter">openrouter</option>
+                <option value="nvidia">nvidia</option>
+                <option value="zen">zen</option>
+                <option value="custom">custom (openai-compatible)</option>
+              </select>
+            </label>
+            <label class="muted" style="font-size:12px">Name
+              <input id="ap-name" type="text" placeholder="provider name" style="width:100%;margin-top:4px">
+            </label>
+          </div>
+          <label class="muted" style="font-size:12px;display:block;margin-top:10px">Base URL
+            <input id="ap-base" type="text" placeholder="https://… (empty = default)" style="width:100%;margin-top:4px">
+          </label>
+          <label class="muted" style="font-size:12px;display:block;margin-top:10px">API Keys (ek line per key)
+            <textarea id="ap-keys" rows="2" placeholder="key1&#10;key2&#10;key3" style="width:100%;margin-top:4px"></textarea>
+          </label>
+          <label class="muted" style="font-size:12px;display:block;margin-top:10px">Models (comma separated — auto-filled hota hai, edit kar sakte ho)
+            <input id="ap-models" type="text" placeholder="model-1, model-2" style="width:100%;margin-top:4px">
+          </label>
+          <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button class="btn" onclick="addProviderSubmit()">💾 Add Provider</button>
+            <button class="btn sec" onclick="toggleAddProvider()">Cancel</button>
+          </div>
+        </div>
         <div class="err" id="providers-err"></div>
         <div class="ok" id="providers-ok"></div>
         <div id="providers-list"><span class="muted">Loading…</span></div>
@@ -2890,6 +2932,53 @@ async function refreshProvidersLive() {
   const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Refresh failed'; return; }
   document.getElementById('providers-ok').textContent = '✅ Live models refresh ho gaye';
+  await loadProvidersAdmin();
+}
+
+// ---------- add provider ----------
+const ADD_PRESETS = {
+  'gemini':     { name: 'gemini', type: 'gemini', base_url: '', models: 'gemini-2.5-flash' },
+  'groq':       { name: 'groq', type: 'openai', base_url: 'https://api.groq.com/openai/v1', models: 'llama-3.3-70b-versatile' },
+  'openrouter': { name: 'openrouter', type: 'openai', base_url: 'https://openrouter.ai/api/v1', models: 'meta-llama/llama-4-maverick:free' },
+  'nvidia':     { name: 'nvidia', type: 'openai', base_url: 'https://integrate.api.nvidia.com/v1', models: 'meta/llama-3.3-70b-instruct' },
+  'zen':        { name: 'zen', type: 'openai', base_url: 'https://opencode.ai/zen/v1', models: 'big-pickle' },
+  'custom':     { name: '', type: 'openai', base_url: '', models: '' },
+};
+function toggleAddProvider() {
+  const f = document.getElementById('add-provider-form');
+  const show = f.style.display === 'none';
+  f.style.display = show ? '' : 'none';
+  if (show) onAddProviderPick();
+}
+function onAddProviderPick() {
+  const sel = document.getElementById('ap-provider').value;
+  const preset = ADD_PRESETS[sel] || null;
+  if (!preset) return;
+  document.getElementById('ap-name').value = preset.name;
+  document.getElementById('ap-base').value = preset.base_url;
+  document.getElementById('ap-models').value = preset.models;
+}
+async function addProviderSubmit() {
+  document.getElementById('providers-err').textContent = '';
+  document.getElementById('providers-ok').textContent = '';
+  const preset = ADD_PRESETS[document.getElementById('ap-provider').value];
+  const name = document.getElementById('ap-name').value.trim();
+  if (!name) { document.getElementById('providers-err').textContent = 'Provider name required'; return; }
+  const body = {
+    name: name,
+    type: (preset && preset.type) || 'openai',
+    base_url: document.getElementById('ap-base').value.trim(),
+    models: document.getElementById('ap-models').value.split(',').map(s => s.trim()).filter(Boolean),
+    api_keys: document.getElementById('ap-keys').value.split('\\n').map(s => s.trim()).filter(Boolean),
+    enabled: document.getElementById('ap-enabled').checked,
+    replace_keys: true,
+    selected_keys: [],
+  };
+  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
+  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Add failed'; return; }
+  document.getElementById('providers-ok').textContent = data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
+  document.getElementById('ap-keys').value = '';
+  document.getElementById('add-provider-form').style.display = 'none';
   await loadProvidersAdmin();
 }
 
