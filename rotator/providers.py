@@ -261,8 +261,12 @@ class OpenAICompatibleProvider(Provider):
     def __init__(self, name: str, base_url: str, models: list[str], web_search_passthrough: bool = False):
         super().__init__(models)
         self.name = name
-        self.base_url = base_url.rstrip("/")
-        self.endpoint = f"{self.base_url}/chat/completions"
+        # top-level base_url optional ho sakta hai — jab har key ka apna
+        # gateway ho (per-key base_url), koi provider-wide default zaroori
+        # nahi. Yahan hard-fail nahi karte; agar koi key request-time pe bhi
+        # apna base_url na de aur yeh bhi khaali ho, tabhi chat() error dega.
+        self.base_url = base_url.rstrip("/") if base_url else ""
+        self.endpoint = f"{self.base_url}/chat/completions" if self.base_url else None
         self.web_search_passthrough = web_search_passthrough
 
     async def chat(
@@ -292,6 +296,11 @@ class OpenAICompatibleProvider(Provider):
         endpoint = self.endpoint
         if base_url:
             endpoint = base_url.rstrip("/") + "/chat/completions"
+        if not endpoint:
+            raise ProviderError(
+                f"{self.name}: base_url configured nahi hai (na provider-wide, na is key ka apna)",
+                retryable=False,
+            )
 
         payload_messages = [self._to_openai_message(m) for m in messages]
         payload = {
@@ -896,9 +905,11 @@ def build_provider(
         # allowed — default Google endpoint tab use hota hai jab koi nahi diya
         return GeminiProvider(models, base_url or GEMINI_V1)
     if ptype == "openai":
-        if not base_url:
-            raise ValueError(f"provider '{name}': openai type needs base_url")
-        return OpenAICompatibleProvider(name, base_url, models, web_search_passthrough=web_search_passthrough)
+        # base_url yahan mandatory nahi — agar har key ka apna per-key
+        # base_url hai (Cloudflare Worker jaisa gateway), provider-wide
+        # default ki zaroorat nahi. Missing endpoint ka actual check
+        # request-time pe OpenAICompatibleProvider.chat() karta hai.
+        return OpenAICompatibleProvider(name, base_url or "", models, web_search_passthrough=web_search_passthrough)
     raise ValueError(f"provider '{name}': unknown type '{ptype}'")
 
 

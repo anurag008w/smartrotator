@@ -952,11 +952,12 @@ async def _refresh_live_models(request: Request, name: str, force: bool = False)
 
     rotator: Rotator = request.app.state.rotator
     # provider info dhoondo: custom store → rotator state → raw config
-    ptype, base_url, api_keys, models = None, None, [], []
+    ptype, base_url, api_keys, models, key_base_urls = None, None, [], [], {}
     for st in rotator.providers:
         if st.cfg.name == name:
             ptype, base_url, api_keys = st.cfg.ptype, st.cfg.base_url, list(st.cfg.keys)
             models = list(st.cfg.models)
+            key_base_urls = dict(st.cfg.key_base_urls)
             break
     if ptype is None:
         for p in _load_config().get("providers", []):
@@ -974,11 +975,18 @@ async def _refresh_live_models(request: Request, name: str, force: bool = False)
             base_url = cp.get("base_url")
             api_keys = cp.get("api_keys", [])
             models = cp.get("models", [])
+            key_base_urls = dict(cp.get("key_base_urls") or {})
 
     if ptype is None or not api_keys:
         entry = {"fetched_at": now, "models": [], "error": "provider not configured / no keys"}
         cache[name] = entry
         return entry
+
+    # top-level base_url khaali ho sakta hai jab har key ka apna gateway ho
+    # (per-key base_url) — live-models listing ke liye pehli available
+    # per-key base_url use karo, warna default pe fall karo.
+    if not base_url and key_base_urls:
+        base_url = next((key_base_urls[k] for k in api_keys if k in key_base_urls), None)
 
     try:
         live = await fetch_live_models(name, ptype, base_url, api_keys)
@@ -1205,8 +1213,6 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
             base_url = runtime_cfg["base_url"]
         else:
             base_url = _default_base_url(ptype)
-    if ptype == "openai" and not base_url:
-        raise HTTPException(status_code=400, detail="openai provider needs base_url")
 
     # ---- keys: merge / replace / preserve ----
     new_keys = [k.strip() for k in req.api_keys if k.strip() and not k.startswith("PASTE_")]
@@ -1230,6 +1236,21 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
     if not keys:
         raise HTTPException(status_code=400, detail="At least one API key required")
 
+    # ---- per-key base_url resolve karo (validation ke liye keys chahiye,
+    # isliye yeh keys resolve hone ke baad hi ho sakta hai) ----
+    resolved_key_base_urls = _resolve_key_base_urls(req.key_base_urls, keys)
+
+    # top-level base_url zaroori hai SIRF unhi keys ke liye jinka apna
+    # per-key base_url set nahi hai — agar har key ka alag gateway hai
+    # (jaise Cloudflare Worker per key), top-level blank chhodna valid hai.
+    if ptype == "openai" and not base_url:
+        keys_missing_base_url = [k for k in keys if k not in resolved_key_base_urls]
+        if keys_missing_base_url:
+            raise HTTPException(
+                status_code=400,
+                detail="openai provider needs base_url (ya har key ka apna base_url set karo)",
+            )
+
     # ---- models: empty → existing custom / runtime config preserve ----
     models = [m.strip() for m in req.models if m.strip()]
     if not models and existing and existing.get("models"):
@@ -1247,7 +1268,7 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
         "models": models,
         "enabled": req.enabled,
         # key_base_urls: {key: url} ya {index: url} dono accept — index wale ko resolve
-        "key_base_urls": _resolve_key_base_urls(req.key_base_urls, keys),
+        "key_base_urls": resolved_key_base_urls,
         # selected_keys: sirf ye keys rotation me use hongi (empty = sab selected)
         "selected_keys": [i for i in (req.selected_keys or []) if 0 <= i < len(keys)],
     }
