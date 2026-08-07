@@ -87,13 +87,21 @@ def test_full_flow():
         tok = _register_and_promote_superadmin(client)
         h = {"Authorization": "Bearer " + tok}
 
-        # 1) GET — config.yaml wale providers UI me NAHI dikhte (hidden)
+        # 1) GET — env-keys wale config provider dikhta hai (source config),
+        #     bina keys wale config defaults (PASTE_ placeholders) hidden
         r = client.get("/admin/providers", headers=h)
         assert r.status_code == 200, r.text
-        names = {p["name"] for p in r.json()["providers"]}
-        assert "gemini" not in names, names
+        provs = r.json()["providers"]
+        names = {p["name"] for p in provs}
+        assert "gemini" in names, provs
+        gem = next(p for p in provs if p["name"] == "gemini")
+        assert gem["source"] == "config", gem
+        assert gem["key_count"] == 2, gem  # runtime env keys
+        assert any(k["preview"] for k in gem["keys"]), gem
+        # bina keys wale config defaults hidden (PASTE_ placeholders)
+        assert "groq" not in names, names
 
-        # 2) POST — naya custom provider add (base_url + keys + models)
+        # 2) POST — base_url update karo (keys empty = preserve), merge
         r = client.post("/admin/providers", headers=h, json={
             "name": "gemini",
             "type": "gemini",
@@ -103,7 +111,7 @@ def test_full_flow():
             "enabled": True,
         })
         assert r.status_code == 200, r.text
-        assert r.json()["key_count"] == 3, r.json()  # 2 runtime config keys + 1 new
+        assert r.json()["key_count"] == 3, r.json()  # 2 existing + 1 new
 
         # custom store me check
         r = client.get("/admin/providers", headers=h)
@@ -111,7 +119,6 @@ def test_full_flow():
         assert gem["base_url"] == "https://my-worker.workers.dev/v1beta", gem
         assert gem["key_count"] == 3, gem
         assert gem["source"] == "custom", gem
-        assert any(k["preview"] for k in gem["keys"]), gem
 
         # 3) replace_keys = true — purani hatake nayi
         r = client.post("/admin/providers", headers=h, json={
@@ -132,12 +139,13 @@ def test_full_flow():
         assert gem["base_url"] == "https://my-worker.workers.dev/v1beta", gem
         assert gem["models"] == ["gemini-2.5-flash"], gem
 
-        # 5) delete custom — config default (hidden) wapas, list se gayab
+        # 5) delete custom — wapas config default (env keys) dikhta hai
         r = client.delete("/admin/providers/gemini", headers=h)
         assert r.status_code == 200, r.text
         provs = client.get("/admin/providers", headers=h).json()["providers"]
-        names = {p["name"] for p in provs}
-        assert "gemini" not in names, names
+        gem = next(p for p in provs if p["name"] == "gemini")
+        assert gem["source"] == "config", gem
+        assert gem["key_count"] == 2, gem  # env keys wapas (config ke)
         return True
 
 

@@ -1135,8 +1135,11 @@ async def admin_providers(request: Request):
         config_providers[n] for n in all_names if n not in custom_names
     ] + [config_providers[n] for n in all_names if n in custom_names]
 
-    # sirf dashboard-se-managed providers dikhao — config.yaml ke defaults hide
-    ordered = [p for p in ordered if p.get("source") != "config"]
+    # sirf dashboard-se-managed providers dikhao — config.yaml ke default
+    # placeholder providers (0 keys, PASTE_ wale) hide. Env secrets se keys
+    # milne wale config providers (GEMINI_KEYS etc.) MUST show — user ko pata
+    # hona chahiye ki unki Render secrets detect hui hain.
+    ordered = [p for p in ordered if p.get("source") != "config" or p.get("key_count", 0) > 0]
 
     cache = _live_cache(request)
     status = []
