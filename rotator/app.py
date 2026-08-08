@@ -2415,9 +2415,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <label>Base URL</label>
       <input id="ap-base-url" type="text" placeholder="https://...">
 
-      <div class="ok" id="ap-keys-status" style="margin-top:12px"></div>
-      <div id="ap-keys-list" style="margin-top:6px"></div>
-
       <div id="ap-profiles-wrap" style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
           <b style="font-size:13px">🔗 Profiles — alag-alag gateway URL per key group</b>
@@ -3391,8 +3388,7 @@ function selectCustomProviderPreset() {
   document.getElementById('ap-base-url').value = '';
   document.getElementById('ap-custom-envname').textContent = '—';
   document.getElementById('ap-test-result').textContent = '';
-  renderApKeyList([]);
-  document.getElementById('ap-keys-status').textContent = '';
+  apDetectedKeys = [];
   document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.';
   document.getElementById('addProviderStep1').style.display = 'none';
   document.getElementById('addProviderStep2').style.display = '';
@@ -3406,51 +3402,23 @@ function onCustomProviderNameInput() {
   document.getElementById('ap-custom-envname').textContent = name ? (name.toUpperCase() + '_KEYS') : '—';
   clearTimeout(apCustomNameDebounce);
   if (!name) {
-    document.getElementById('ap-keys-status').textContent = '';
     document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.';
-    renderApKeyList([]);
+    apDetectedKeys = [];
+    renderApProfiles();
     return;
   }
   apCustomNameDebounce = setTimeout(() => refreshDetectedKeys(name, name.toUpperCase() + '_KEYS'), 350);
 }
 async function refreshDetectedKeys(name, envVar) {
-  const statusEl = document.getElementById('ap-keys-status');
   const errEl = document.getElementById('ap-keys-err');
-  statusEl.textContent = '🔍 checking ' + envVar + '…';
   errEl.textContent = '';
-  renderApKeyList([]);
+  apDetectedKeys = [];
   const { res, data } = await api('/admin/providers/detect-keys?name=' + encodeURIComponent(name));
-  if (!res.ok) { statusEl.textContent = ''; errEl.textContent = data.detail || 'Key detection failed'; return; }
-  if (data.key_count > 0) {
-    statusEl.textContent = `✅ ${data.key_count} key${data.key_count === 1 ? '' : 's'} detected from ${data.env_var} — jo use karni hain unhi ko select rehne do (default: sab).`;
-    renderApKeyList(data.keys);
-  } else {
-    statusEl.textContent = '';
+  if (!res.ok) { errEl.textContent = data.detail || 'Key detection failed'; return; }
+  apDetectedKeys = data.keys || [];
+  if (!apDetectedKeys.length && data.env_var) {
     errEl.textContent = `⚠️ ${data.env_var} me koi key nahi mili. Host secrets me "${data.env_var}=key1,key2,..." add karke (multiple keys ek saath) dobara try karo.`;
   }
-}
-function renderApKeyList(keys) {
-  apDetectedKeys = keys || [];
-  // edit mode (apSaved) me saved key selection restore karo — empty selected_keys
-  // matlab sab selected (router default). Pehle sab "checked" hota tha, jo edit pe
-  // galat selection dikhata tha.
-  const saved = apSaved;
-  const selSet = (saved && (saved.selected_keys || []).length) ? new Set(saved.selected_keys) : null;
-  const useAll = !selSet;
-  const savedKeyByIndex = {};
-  if (saved) (saved.keys || []).forEach(sk => { savedKeyByIndex[sk.index] = sk; });
-  const box = document.getElementById('ap-keys-list');
-  box.innerHTML = apDetectedKeys.map(k => {
-    const on = useAll || selSet.has(k.index);
-    const sk = savedKeyByIndex[k.index];
-    const urlHint = sk && sk.base_url ? `<span class="muted" style="font-size:11px;margin-left:auto;max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🌐 ${sk.base_url}</span>` : '';
-    return `
-    <label class="chip ${on ? 'checked' : ''}" style="width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" class="ap-key-cb" value="${k.index}" ${on ? 'checked' : ''} onchange="this.parentElement.classList.toggle('checked', this.checked)">
-      API Key ${k.index + 1}: <code style="background:transparent;font-size:12px">${k.preview}</code>
-      ${urlHint}
-    </label>`;
-  }).join('');
   renderApProfiles();
 }
 
@@ -3494,11 +3462,6 @@ function saveApProfile() {
   if (!keyIndices.length) { errEl.textContent = 'Kam se kam ek API key select karo'; return; }
   if (apEditingProfile >= 0) apProfiles[apEditingProfile] = { url, keyIndices };
   else apProfiles.push({ url, keyIndices });
-  // profile me select ki gayi keys active bhi banao (main key list me check)
-  keyIndices.forEach(ki => {
-    const cb = document.querySelector('.ap-key-cb[value="' + ki + '"]');
-    if (cb) { cb.checked = true; cb.parentElement.classList.add('checked'); }
-  });
   apEditingProfile = -1;
   backToProviderSetup();
 }
@@ -3589,7 +3552,8 @@ async function testAddProviderBaseUrl() {
   const { name, type } = apCurrentNameType();
   const base_url = document.getElementById('ap-base-url').value.trim();
   if (!name) { errEl.textContent = 'Provider name required'; return; }
-  const key_indices = Array.from(document.querySelectorAll('.ap-key-cb:checked')).map(i => parseInt(i.value, 10));
+  // Step 2 key list hat gayi — saari detected keys active hain (default sab)
+  const key_indices = apDetectedKeys.map(k => k.index);
   resultEl.className = 'muted';
   resultEl.style.fontSize = '12px';
   resultEl.textContent = '🧪 testing…';
@@ -3603,11 +3567,9 @@ async function submitNewProvider() {
   const { name, type } = apCurrentNameType();
   const base_url = document.getElementById('ap-base-url').value.trim();
   if (!name) { document.getElementById('ap-keys-err').textContent = 'Provider name required'; return; }
-  const key_indices = Array.from(document.querySelectorAll('.ap-key-cb:checked')).map(i => parseInt(i.value, 10));
-  if (apDetectedKeys.length && !key_indices.length) {
-    document.getElementById('ap-keys-err').textContent = 'Kam se kam ek API key select karo';
-    return;
-  }
+  // Step 2 key list hat gayi — saari detected keys active hain. Profiles sirf
+  // routing decide karti hain (keys konsi gateway base_url pe jayengi).
+  const key_indices = apDetectedKeys.map(k => k.index);
   // safety: edit mode me agar apSaved null hai (providersData stale tha, profiles
   // load nahi hui) aur provider already exists, toh existing key_base_urls preserve
   // karo — warna empty profiles se saved profiles accidentally wipe ho jati.
