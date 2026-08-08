@@ -2097,7 +2097,7 @@ def _convert_message(m: dict) -> ChatMessage:
 # --------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return DASHBOARD_HTML
+    return HTMLResponse(DASHBOARD_HTML, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"})
 
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -2417,6 +2417,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       <div class="ok" id="ap-keys-status" style="margin-top:12px"></div>
       <div id="ap-keys-list" style="margin-top:6px"></div>
+
+      <div id="ap-profiles-wrap" style="margin-top:14px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
+          <b style="font-size:13px">🔗 Profiles — alag-alag gateway URL per key group</b>
+          <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="addApProfile()">+ Add Profile</button>
+        </div>
+        <div class="muted" style="font-size:11px;margin-bottom:6px">Har profile ka apna base_url (jaise alag Cloudflare worker) + konse keys usme jayengi. Jo keys kisi profile me nahi, wo upar wale Base URL pe jaayengi.</div>
+        <div id="ap-profiles-list"></div>
+      </div>
+
       <div class="err" id="ap-keys-err"></div>
 
       <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -3129,7 +3139,7 @@ function renderProviders() {
         <label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;width:100%;box-sizing:border-box;justify-content:flex-start">
           <input type="checkbox" id="prov-ksel-${idx}-${ki}" ${on ? 'checked' : ''} onchange="toggleProviderKey(${idx})">
           🔑&nbsp;<code style="background:transparent;font-size:12px">${k.preview}</code>
-          <span class="muted" style="font-size:11px;margin-left:auto">${on ? '✅ is base_url pe use ho rahi' : '⏸ use nahi ho rahi'}</span>
+          <span class="muted" style="font-size:11px;margin-left:auto;max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${k.base_url ? '🌐 ' + k.base_url : (on ? '✅ is base_url pe use ho rahi' : '⏸ use nahi ho rahi')}</span>
         </label>
       </div>`;
     }).join('');
@@ -3185,9 +3195,13 @@ async function saveProviderAdmin(idx) {
   document.getElementById('providers-ok').textContent = '';
   const keys = (p.keys || []);
   const selected_keys = [];
+  const key_base_urls = {};
   keys.forEach((k, ki) => {
     const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
     if (cb && cb.checked) selected_keys.push(ki);
+    // existing per-key base_url preserve (profiles se aaye) — card pe edit UI nahi,
+    // bas jo save hua hai wahi wapas bhejo warna profiles wipe ho jayengi
+    if (k.base_url) key_base_urls[ki] = k.base_url;
   });
   const body = {
     name: p.name,
@@ -3195,6 +3209,7 @@ async function saveProviderAdmin(idx) {
     base_url: document.getElementById('prov-base-' + idx).value.trim(),
     enabled: document.getElementById('prov-enabled-' + idx).checked,
     selected_keys: selected_keys,
+    key_base_urls: key_base_urls,
   };
   const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Save failed'; return; }
@@ -3224,6 +3239,7 @@ async function resyncProviderKeys(name) {
 let apPresets = [];
 let apSelected = null;      // { name, type, base_url, env_var, isCustom }
 let apDetectedKeys = [];    // [{index, preview}] — abhi ke provider ki detected keys
+let apProfiles = [];        // [{url, keyIndices:[]}] — per-key group gateway URLs
 
 function openAddProviderModal() {
   document.getElementById('addProviderModal').style.display = 'flex';
@@ -3233,10 +3249,14 @@ function openAddProviderModal() {
 }
 function closeAddProviderModal() {
   document.getElementById('addProviderModal').style.display = 'none';
+  apProfiles = [];
+  renderApProfiles();
 }
 function backToProviderPresets() {
   document.getElementById('addProviderStep1').style.display = '';
   document.getElementById('addProviderStep2').style.display = 'none';
+  apProfiles = [];
+  renderApProfiles();
 }
 async function loadProviderCatalogPicker() {
   const box = document.getElementById('addProviderPresets');
@@ -3258,6 +3278,7 @@ async function loadProviderCatalogPicker() {
 function selectProviderPreset(i) {
   const p = apPresets[i];
   apSelected = { name: p.name, type: p.type, base_url: p.base_url, env_var: p.env_var, isCustom: false };
+  apProfiles = [];
   document.getElementById('ap-custom-name-wrap').style.display = 'none';
   document.getElementById('ap-name-label').textContent = p.icon + ' ' + p.label;
   document.getElementById('ap-type-badge').textContent = p.type;
@@ -3269,6 +3290,7 @@ function selectProviderPreset(i) {
 }
 function selectCustomProviderPreset() {
   apSelected = { name: '', type: 'openai', base_url: '', env_var: '', isCustom: true };
+  apProfiles = [];
   document.getElementById('ap-custom-name-wrap').style.display = '';
   document.getElementById('ap-custom-name').value = '';
   document.getElementById('ap-custom-type').value = 'openai';
@@ -3323,6 +3345,58 @@ function renderApKeyList(keys) {
       <input type="checkbox" class="ap-key-cb" value="${k.index}" checked onchange="this.parentElement.classList.toggle('checked', this.checked)">
       API Key ${k.index + 1}: <code style="background:transparent;font-size:12px">${k.preview}</code>
     </label>`).join('');
+  renderApProfiles();
+}
+
+// ---- Profiles: har profile = apna gateway base_url + usme jane wali keys ----
+function addApProfile() {
+  apProfiles.push({ url: '', keyIndices: [] });
+  renderApProfiles();
+}
+function removeApProfile(pi) {
+  apProfiles.splice(pi, 1);
+  renderApProfiles();
+}
+function updateApProfileKey(pi, ki, checked) {
+  const prof = apProfiles[pi];
+  if (!prof) return;
+  const set = new Set(prof.keyIndices);
+  if (checked) set.add(ki); else set.delete(ki);
+  prof.keyIndices = Array.from(set).sort((a, b) => a - b);
+}
+function renderApProfiles() {
+  const list = document.getElementById('ap-profiles-list');
+  if (!list) return;
+  if (!apProfiles.length) {
+    list.innerHTML = '<div class="muted" style="font-size:12px">Koi profile nahi — saari keys upar wale Base URL pe chalengi. "+ Add Profile" se alag gateway add karo.</div>';
+    return;
+  }
+  list.innerHTML = apProfiles.map((prof, pi) => `
+    <div style="border:1px solid var(--panel2);border-radius:8px;padding:8px;margin-bottom:8px">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <b style="font-size:12px">Profile ${pi + 1}</b>
+        <input id="ap-prof-url-${pi}" type="text" value="${(prof.url || '').replace(/"/g, '&quot;')}" placeholder="https://worker.../gemini/v1beta" style="flex:1;min-width:200px">
+        <button class="btn sec" style="padding:3px 8px;font-size:11px" onclick="removeApProfile(${pi})">🗑</button>
+      </div>
+      <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">
+        ${apDetectedKeys.map(k => {
+          const on = prof.keyIndices.includes(k.index);
+          return `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;padding:3px 8px;font-size:12px">
+            <input type="checkbox" class="ap-prof-key" value="${k.index}" data-pi="${pi}" ${on ? 'checked' : ''} onchange="this.parentElement.classList.toggle('checked', this.checked); updateApProfileKey(parseInt(this.dataset.pi,10), parseInt(this.value,10), this.checked)">
+            key ${k.index + 1}</label>`;
+        }).join('')}
+      </div>
+    </div>`).join('');
+}
+function collectApKeyBaseUrls() {
+  // {index: url} — profile me diye gaye URLs ko key index se map karo
+  const out = {};
+  apProfiles.forEach((prof, pi) => {
+    const url = (document.getElementById('ap-prof-url-' + pi).value || '').trim();
+    if (!url) return;
+    prof.keyIndices.forEach(ki => { out[ki] = url; });
+  });
+  return out;
 }
 function apCurrentNameType() {
   const name = apSelected.isCustom ? document.getElementById('ap-custom-name').value.trim() : apSelected.name;
@@ -3363,7 +3437,7 @@ async function submitNewProvider() {
   // ACTUALLY is base_url pe use karni hain. Koi key kabhi type/paste nahi hoti.
   const { res, data } = await api('/admin/providers', {
     method: 'POST',
-    body: JSON.stringify({ name, type, base_url, enabled, selected_keys: key_indices }),
+    body: JSON.stringify({ name, type, base_url, enabled, selected_keys: key_indices, key_base_urls: collectApKeyBaseUrls() }),
   });
   btn.disabled = false; btn.textContent = '💾 Save';
   if (!res.ok) { document.getElementById('ap-keys-err').textContent = data.detail || 'Save failed'; return; }
