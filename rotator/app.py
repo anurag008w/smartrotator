@@ -3131,7 +3131,6 @@ function renderProviders() {
           🔑&nbsp;<code style="background:transparent;font-size:12px">${k.preview}</code>
           <span class="muted" style="font-size:11px;margin-left:auto">${on ? '✅ is base_url pe use ho rahi' : '⏸ use nahi ho rahi'}</span>
         </label>
-        <input id="prov-kbase-${idx}-${ki}" type="text" value="${(k.base_url || '').replace(/"/g, '&quot;')}" placeholder="is key ka apna base_url (optional — warna upar wala base_url)" style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;font-size:12px">
       </div>`;
     }).join('');
     return `
@@ -3185,12 +3184,9 @@ async function saveProviderAdmin(idx) {
   document.getElementById('providers-err').textContent = '';
   document.getElementById('providers-ok').textContent = '';
   const keys = (p.keys || []);
-  const key_base_urls = {};
   const selected_keys = [];
   keys.forEach((k, ki) => {
-    const v = document.getElementById('prov-kbase-' + idx + '-' + ki);
     const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
-    if (v && v.value.trim()) key_base_urls[String(ki)] = v.value.trim();
     if (cb && cb.checked) selected_keys.push(ki);
   });
   const body = {
@@ -3198,7 +3194,6 @@ async function saveProviderAdmin(idx) {
     type: p.type,
     base_url: document.getElementById('prov-base-' + idx).value.trim(),
     enabled: document.getElementById('prov-enabled-' + idx).checked,
-    key_base_urls: key_base_urls,
     selected_keys: selected_keys,
   };
   const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
