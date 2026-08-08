@@ -2288,9 +2288,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <!-- SETTINGS -->
     <div class="view" id="view-settings">
       <div class="card">
-        <h3 style="margin-bottom:14px">App Integration — login based (no API key)</h3>
-        <p class="muted" style="margin-bottom:10px">App me login karo, JWT token lo, wahi use karo. Per-user limit apne aap apply hogi:</p>
-        <pre id="code-sample" style="background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px;font-size:12px;overflow:auto;margin-bottom:14px"></pre>
+        <h3 style="margin-bottom:14px">App Integration</h3>
+        <p class="muted" style="margin-bottom:10px">App / OpenAI SDK me yehi base_url use karo:</p>
+        <div class="keybox">
+          <input id="app-base-url" readonly>
+          <button class="btn sec" onclick="copyAppBaseUrl()">📋 Copy</button>
+        </div>
         <hr style="border:none;border-top:1px solid var(--border);margin:20px 0">
         <h3 style="margin-bottom:10px">API Key (optional — OpenAI SDK ke liye)</h3>
         <p class="muted" style="margin-bottom:10px">Agar OpenAI SDK hi use karni ho toh sk- key bhi chalegi:
@@ -2495,7 +2498,7 @@ function logout() { localStorage.removeItem('sr_token'); token = ''; location.re
     if (res.ok) {
       showMain(data.user, data.is_super_admin);
       document.getElementById('api-key').value = data.api_key || '';
-      updateCodeSample();
+      setAppBaseUrl();
       loadModels(); loadMe();
     } else showAuth();
   } else showAuth();
@@ -2745,24 +2748,21 @@ function setSettingsMsg(text, ok) {
   const el = document.getElementById(ok ? 'settings-ok' : 'settings-err');
   el.textContent = text; setTimeout(() => el.textContent = '', 3000);
 }
-function updateCodeSample() {
-  const base = location.origin;
-  document.getElementById('code-sample').textContent =
-`# STEP 1 — login karo, JWT token lo (koi API key nahi chahiye)
-import requests
-
-r = requests.post("${base}/auth/login",
-                  json={"username": "YOUR_USER", "password": "YOUR_PASS"})
-token = r.json()["token"]
-
-# STEP 2 — token se chat karo (per-user quota apne aap apply hogi)
-resp = requests.post("${base}/v1/chat/completions",
-    headers={"Authorization": "Bearer " + token},
-    json={"messages": [{"role": "user", "content": "Hello!"}]})
-print(resp.json()["choices"][0]["message"]["content"])`;
+function setAppBaseUrl() {
+  const el = document.getElementById('app-base-url');
+  if (el) el.value = location.origin + '/v1';
 }
-document.addEventListener('input', updateCodeSample);
-setInterval(() => { const k = document.getElementById('api-key').value; if (k && location.origin) updateCodeSample(); }, 500);
+function copyAppBaseUrl() {
+  const el = document.getElementById('app-base-url');
+  if (!el) return;
+  el.select();
+  navigator.clipboard.writeText(el.value).then(() => {
+    setSettingsMsg('✅ Base URL copied!', true);
+  }).catch(() => {
+    document.execCommand('copy');
+    setSettingsMsg('✅ Base URL copied!', true);
+  });
+}
 
 // ---------- admin ----------
 async function loadAdmin() {
