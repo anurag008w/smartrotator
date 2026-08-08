@@ -22,3 +22,6 @@ data/.enc-key
 test_data_*/
 *.tmp
 .corrupt-*
+
+# Cloudflare wrangler
+node_modules/

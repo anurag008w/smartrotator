@@ -1,0 +1,15 @@
+# SmartRotator — Cloudflare Worker config
+# Deploy:  npx wrangler deploy
+# Auth:    CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID env vars
+#          (ye ~/.config/smartrotator/cloudflare.env me safe hain — GitHub pe nahi)
+# Worker 24/7 Cloudflare ke datacenters pe chalta hai — koi server/laptop nahi chahiye.
+
+name = "smartrotator"
+main = "cloudflare-worker.js"
+compatibility_date = "2024-11-01"
+
+# workers.dev subdomain pe deploy (free plan)
+workers_dev = true
+
+[observability]
+enabled = true
