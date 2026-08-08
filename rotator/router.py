@@ -206,7 +206,13 @@ class Rotator:
             sel = cfg.get("selected_keys") or []
             if sel:
                 keys = [keys[i] for i in sel if 0 <= i < len(keys)]
-            if not name or not keys or not models:
+            # NOTE: `models` yahan mandatory NAHI hai — model selection ab
+            # 🎚 Exposed Models tab (live-fetch se) ka kaam hai. Provider
+            # bina models ke bhi build hota hai (rotation me routing tabhi
+            # hogi jab Exposed tab / Model Group se koi model assign ho) —
+            # isse yeh turant Exposed tab me dikhta hai aur live models
+            # fetch kiye ja sakte hain.
+            if not name or not keys:
                 continue
             custom_states.append(
                 self._build_state(

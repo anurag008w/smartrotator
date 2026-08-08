@@ -1131,9 +1131,11 @@ async def admin_providers_catalog(request: Request):
 async def admin_detect_keys(name: str, request: Request):
     """Custom/manual provider name ke liye env keys live-detect karo.
 
-    "Add Provider" modal me "Custom / Other" choose karne pe, admin naam
-    type karta hai aur yeh endpoint <NAME>_KEYS env var check karke keys
-    ka count + masked preview deta hai — koi key kabhi type nahi karni.
+    "Add Provider" modal me provider select karte hi (ya "Custom / Other"
+    me naam type karte hi) yeh <NAME>_KEYS env var check karke har key ka
+    masked preview + index deta hai — taaki UI "API Key 1 / API Key 2 / ..."
+    jaise individually SELECT karne ka checkbox list dikha sake. Koi bhi
+    key kabhi type/paste nahi karni padti.
     """
     await _require_admin(request)
     name = (name or "").strip()
@@ -1145,7 +1147,65 @@ async def admin_detect_keys(name: str, request: Request):
         "env_var": f"{name.upper()}_KEYS",
         "key_count": len(keys),
         "previews": [_key_preview(k) for k in keys],
+        "keys": [{"index": i, "preview": _key_preview(k)} for i, k in enumerate(keys)],
     }
+
+
+class TestProviderUrlInput(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    type: str = "openai"
+    base_url: str = Field("", max_length=512)
+    key_indices: list[int] = []   # detect-keys ke "index" — empty = saari detected keys me se pehli
+
+
+@app.post("/admin/providers/test-url")
+async def admin_test_provider_url(req: TestProviderUrlInput, request: Request):
+    """"Add Provider" modal ka 🧪 Test button — Save se PEHLE base_url +
+    (selected) key(s) se ek live call karke confirm karta hai ki base_url
+    valid hai ya nahi. Kuch save nahi hota, sirf ek live models fetch try
+    hota hai aur result (ok/error + model count) return hota hai.
+    """
+    await _require_admin(request)
+    name = req.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    ptype = req.type.strip().lower()
+    if ptype not in ("gemini", "openai"):
+        raise HTTPException(status_code=400, detail="type must be 'gemini' or 'openai'")
+    base_url = req.base_url.strip() or None
+
+    # test ke liye keys: env se, warna already-saved (existing custom /
+    # runtime) provider ki keys se — jo bhi mile
+    candidate_keys = _env_keys_for_name(name)
+    if not candidate_keys:
+        rotator: Rotator = request.app.state.rotator
+        st = rotator._find_provider(name)
+        if st is not None:
+            candidate_keys = list(st.cfg.keys)
+    if not candidate_keys:
+        existing = await database.get_custom_provider(name)
+        if existing:
+            candidate_keys = list(existing.get("api_keys", []))
+
+    if req.key_indices:
+        test_keys = [candidate_keys[i] for i in req.key_indices if 0 <= i < len(candidate_keys)]
+    else:
+        test_keys = candidate_keys
+
+    if not test_keys:
+        return {"ok": False, "message": "❌ Test karne ke liye koi key nahi mili"}
+    if ptype == "openai" and not base_url:
+        return {"ok": False, "message": "❌ openai provider ke liye base_url zaroori hai"}
+
+    try:
+        live = await fetch_live_models(name, ptype, base_url, test_keys[:1], timeout=15.0, max_pages=1)
+        return {
+            "ok": True,
+            "message": f"✅ base_url valid — {len(live)} model{'s' if len(live) != 1 else ''} mile",
+            "model_count": len(live),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": f"❌ {str(exc)[:300]}"}
 
 
 @app.post("/admin/providers/{name}/resync-keys")
@@ -1410,13 +1470,15 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
             )
 
     # ---- models: empty → existing custom / runtime config preserve ----
+    # Models ab yahan MANDATORY nahi — model select karna 🎚 Exposed Models
+    # tab ka kaam hai (live-fetch se). Provider bina models ke bhi add ho
+    # sakta hai; base_url/keys set hote hi Exposed tab me live models fetch
+    # karke expose kar sakte ho, koi "at least one model" gate nahi.
     models = [m.strip() for m in req.models if m.strip()]
     if not models and existing and existing.get("models"):
         models = [m.strip() for m in existing.get("models", []) if m.strip()]
     if not models and runtime_cfg["models"]:
         models = runtime_cfg["models"]
-    if not models:
-        raise HTTPException(status_code=400, detail="At least one model required")
 
     provider = {
         "name": name,
@@ -2303,7 +2365,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="view" id="view-providers">
       <div class="card">
         <h3 style="margin-bottom:4px">🔌 Provider Settings</h3>
-        <div class="muted" style="margin-bottom:10px">API keys sirf <b>env secrets</b> se aati hain (<b>GEMINI_KEYS</b>, <b>GROQ_KEYS</b>, <b>OPENROUTER_KEYS</b>, <b>NVIDIA_KEYS</b>, <b>ZEN_KEYS</b>, ...) — yahan UI me kabhi key type/paste nahi karni padti. "+ Add Provider" se ek provider select karo, base_url + detected keys apne aap dikh jayenge. Ek base_url pe env var me jitni bhi keys comma-separated ho, sab automatically rotate hoti hain. 💾</div>
+        <div class="muted" style="margin-bottom:10px">API keys sirf <b>env secrets</b> se aati hain (<b>GEMINI_KEYS</b>, <b>GROQ_KEYS</b>, <b>OPENROUTER_KEYS</b>, <b>NVIDIA_KEYS</b>, <b>ZEN_KEYS</b>, ...) — yahan UI me kabhi key type/paste nahi karni padti. "+ Add Provider" se ek provider select karo, base_url + detected keys apne aap dikh jayenge. Har provider card pe jo keys use karni hain unhi ko select karo — sab selected keys ek hi base_url pe automatically rotate hoti hain. Models yahan set nahi hote — woh <b>🎚 Exposed Models</b> tab se manage karo. 💾</div>
         <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="btn" onclick="openAddProviderModal()">➕ Add Provider</button>
           <button class="btn sec" onclick="refreshProvidersLive()">🔄 Refresh Live Models</button>
@@ -2351,18 +2413,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <label>Base URL</label>
       <input id="ap-base-url" type="text" placeholder="https://...">
 
-      <div class="ok" id="ap-keys-status" style="margin-top:10px"></div>
+      <div class="ok" id="ap-keys-status" style="margin-top:12px"></div>
+      <div id="ap-keys-list" style="margin-top:6px"></div>
       <div class="err" id="ap-keys-err"></div>
 
-      <label>Models</label>
-      <div id="ap-models" class="model-list"></div>
-      <input id="ap-models-custom" type="text" placeholder="ya comma-separated model ids yahan daalo (custom provider)" style="margin-top:8px;display:none">
+      <div style="margin-top:12px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <button class="btn sec" onclick="testAddProviderBaseUrl()">🧪 Test Base URL</button>
+        <span id="ap-test-result" class="muted" style="font-size:12px"></span>
+      </div>
+
+      <div class="muted" style="margin-top:10px;font-size:12px">Models yahan nahi chunte — provider save hote hi <b>🎚 Exposed Models</b> tab me jaake live models fetch karke expose kar dena.</div>
 
       <div style="margin-top:12px"><span class="muted" style="font-size:12px"><input id="ap-enabled" type="checkbox" checked> enabled</span></div>
 
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
         <button class="btn sec" onclick="closeAddProviderModal()">Cancel</button>
-        <button class="btn" id="ap-submit-btn" onclick="submitNewProvider()">✅ Add Provider</button>
+        <button class="btn" id="ap-submit-btn" onclick="submitNewProvider()">💾 Save</button>
       </div>
     </div>
   </div>
@@ -3052,43 +3118,68 @@ async function loadProvidersAdmin() {
 function renderProviders() {
   const box = document.getElementById('providers-list');
   const list = (providersData && providersData.providers) || [];
-  if (!list.length) { box.innerHTML = '<div class="muted">Koi provider nahi — config.yaml + API keys daalo.</div>'; return; }
+  if (!list.length) { box.innerHTML = '<div class="muted">Koi provider nahi — "➕ Add Provider" se ek add karo.</div>'; return; }
   box.innerHTML = list.map((p, idx) => {
     const isCustom = p.source === 'custom';
-    const keyRows = (p.keys || []).map((k, ki) => `
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
-        <label style="display:flex;align-items:center;gap:4px;font-size:12px">
-          <input type="checkbox" id="prov-ksel-${idx}-${ki}" ${k.selected !== false ? 'checked' : ''} onchange="saveProviderKeys(${idx})">
+    const keys = p.keys || [];
+    const selectedCount = keys.filter(k => k.selected !== false).length;
+    const keyRows = keys.map((k, ki) => {
+      const on = k.selected !== false;
+      return `
+      <div style="margin-bottom:8px">
+        <label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;width:100%;box-sizing:border-box;justify-content:flex-start">
+          <input type="checkbox" id="prov-ksel-${idx}-${ki}" ${on ? 'checked' : ''} onchange="toggleProviderKey(${idx})">
+          🔑&nbsp;<code style="background:transparent;font-size:12px">${k.preview}</code>
+          <span class="muted" style="font-size:11px;margin-left:auto">${on ? '✅ is base_url pe use ho rahi' : '⏸ use nahi ho rahi'}</span>
         </label>
-        <code style="background:var(--panel2);padding:2px 5px;border-radius:4px;font-size:12px">${k.preview}</code>
-        <input id="prov-kbase-${idx}-${ki}" type="text" value="${(k.base_url || '').replace(/"/g, '&quot;')}" placeholder="key ka apna base_url (optional)" style="width:auto;flex:1;min-width:160px;padding:5px;font-size:12px">
-      </div>`).join('');
+        <input id="prov-kbase-${idx}-${ki}" type="text" value="${(k.base_url || '').replace(/"/g, '&quot;')}" placeholder="is key ka apna base_url (optional — warna upar wala base_url)" style="width:100%;box-sizing:border-box;margin-top:4px;padding:6px 8px;font-size:12px">
+      </div>`;
+    }).join('');
     return `
     <div class="provider-card" style="border:1px solid var(--panel2);border-radius:10px;padding:14px;margin-bottom:12px;background:var(--bg)">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
         <b>${p.name}</b>
         <span class="badge" style="background:var(--panel2);padding:2px 8px;border-radius:10px;font-size:12px">${p.type}</span>
         ${isCustom ? '<span class="badge" style="background:#ffd70022;color:#e8c34c;padding:2px 8px;border-radius:10px;font-size:12px">custom</span>' : '<span class="badge" style="background:var(--panel2);padding:2px 8px;border-radius:10px;font-size:12px">config</span>'}
-        <span class="muted" style="font-size:12px">${p.key_count} key${p.key_count === 1 ? '' : 's'}</span>
+        <span class="muted" style="font-size:12px">${selectedCount}/${keys.length} key${keys.length === 1 ? '' : 's'} in use</span>
         ${p.enabled ? '' : '<span class="badge" style="background:#f4433622;color:#f66;padding:2px 8px;border-radius:10px;font-size:12px">disabled</span>'}
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <label class="muted" style="font-size:12px">Base URL
-          <input id="prov-base-${idx}" type="text" value="${(p.base_url || '').replace(/"/g, '&quot;')}" placeholder="empty = default" style="width:100%;margin-top:4px">
-        </label>
-        <label class="muted" style="font-size:12px">Models (comma separated)
-          <input id="prov-models-${idx}" type="text" value="${(p.models || []).join(', ').replace(/"/g, '&quot;')}" placeholder="model-1, model-2" style="width:100%;margin-top:4px">
-        </label>
+
+      <label class="muted" style="font-size:12px">Base URL <span style="font-size:11px">(selected keys sab isi ek URL pe rotate hongi)</span>
+        <input id="prov-base-${idx}" type="text" value="${(p.base_url || '').replace(/"/g, '&quot;')}" placeholder="empty = default" style="width:100%;margin-top:4px">
+      </label>
+
+      <div class="muted" style="font-size:12px;margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span>Models: ${(p.models && p.models.length) ? p.models.length + ' exposed' : 'abhi koi expose nahi'}</span>
+        <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="showView('exposed'); loadExposed();">🎚 Manage Models</button>
       </div>
-      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+
+      <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+        <b style="font-size:13px">🔑 API Keys — is base_url pe rotate karne ke liye select karo</b>
+        <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="selectAllProviderKeys(${idx})">✅ Select all</button>
+      </div>
+      <div style="margin-top:6px">${keyRows || '<span class="muted">Koi key nahi — 🔁 Sync ya Add Provider se env se pull karo.</span>'}</div>
+
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <span class="muted" style="font-size:12px"><input id="prov-enabled-${idx}" type="checkbox" ${p.enabled ? 'checked' : ''}> enabled</span>
-        <button class="btn" onclick="saveProviderAdmin(${idx}, ${JSON.stringify(p.name).replace(/"/g, '&quot;')})">💾 Save</button>
+        <button class="btn" onclick="saveProviderAdmin(${idx})">💾 Save</button>
         <button class="btn sec" onclick="resyncProviderKeys(${JSON.stringify(p.name).replace(/"/g, '&quot;')})" title="${p.name.toUpperCase()}_KEYS env var se dobara keys pull karo">🔁 Sync keys from env</button>
         ${isCustom ? `<button class="btn sec" onclick="deleteProviderAdmin(${JSON.stringify(p.name).replace(/"/g, '&quot;')})">🗑 Delete</button>` : ''}
       </div>
-      <div style="margin-top:6px">${keyRows}</div>
     </div>`;
   }).join('');
+}
+async function toggleProviderKey(idx) {
+  // key ko check/uncheck karte hi turant save — alag se "Save" dabane ki zaroorat nahi.
+  await saveProviderAdmin(idx);
+}
+async function selectAllProviderKeys(idx) {
+  const p = providersData.providers[idx];
+  (p.keys || []).forEach((k, ki) => {
+    const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
+    if (cb) cb.checked = true;
+  });
+  await saveProviderAdmin(idx);
 }
 async function saveProviderAdmin(idx) {
   const p = providersData.providers[idx];
@@ -3107,18 +3198,15 @@ async function saveProviderAdmin(idx) {
     name: p.name,
     type: p.type,
     base_url: document.getElementById('prov-base-' + idx).value.trim(),
-    models: document.getElementById('prov-models-' + idx).value.split(',').map(s => s.trim()).filter(Boolean),
     enabled: document.getElementById('prov-enabled-' + idx).checked,
     key_base_urls: key_base_urls,
     selected_keys: selected_keys,
   };
   const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Save failed'; return; }
-  document.getElementById('providers-ok').textContent = data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
+  const usedCount = selected_keys.length || keys.length;
+  document.getElementById('providers-ok').textContent = data.message + ' · ' + usedCount + '/' + keys.length + ' keys in use';
   await loadProvidersAdmin();
-}
-function saveProviderKeys(idx) {
-  document.getElementById('providers-ok').textContent = '✅ keys updated (Save dabao to apply)';
 }
 async function deleteProviderAdmin(name) {
   if (!confirm('Delete provider "' + name + '"?')) return;
@@ -3146,7 +3234,8 @@ async function resyncProviderKeys(name) {
 
 // ---------- add provider modal (select provider → base_url + keys auto-detected, no typing) ----------
 let apPresets = [];
-let apSelected = null;   // { name, type, base_url, models, env_var, isCustom }
+let apSelected = null;      // { name, type, base_url, env_var, isCustom }
+let apDetectedKeys = [];    // [{index, preview}] — abhi ke provider ki detected keys
 
 function openAddProviderModal() {
   document.getElementById('addProviderModal').style.display = 'flex';
@@ -3180,29 +3269,27 @@ async function loadProviderCatalogPicker() {
 }
 function selectProviderPreset(i) {
   const p = apPresets[i];
-  apSelected = { name: p.name, type: p.type, base_url: p.base_url, models: p.models, env_var: p.env_var, isCustom: false };
+  apSelected = { name: p.name, type: p.type, base_url: p.base_url, env_var: p.env_var, isCustom: false };
   document.getElementById('ap-custom-name-wrap').style.display = 'none';
-  document.getElementById('ap-models-custom').style.display = 'none';
   document.getElementById('ap-name-label').textContent = p.icon + ' ' + p.label;
   document.getElementById('ap-type-badge').textContent = p.type;
   document.getElementById('ap-base-url').value = p.base_url;
-  renderAddProviderModels(p.models, []);
+  document.getElementById('ap-test-result').textContent = '';
   refreshDetectedKeys(p.name, p.env_var);
   document.getElementById('addProviderStep1').style.display = 'none';
   document.getElementById('addProviderStep2').style.display = '';
 }
 function selectCustomProviderPreset() {
-  apSelected = { name: '', type: 'openai', base_url: '', models: [], env_var: '', isCustom: true };
+  apSelected = { name: '', type: 'openai', base_url: '', env_var: '', isCustom: true };
   document.getElementById('ap-custom-name-wrap').style.display = '';
   document.getElementById('ap-custom-name').value = '';
   document.getElementById('ap-custom-type').value = 'openai';
-  document.getElementById('ap-models-custom').style.display = '';
-  document.getElementById('ap-models-custom').value = '';
   document.getElementById('ap-name-label').textContent = '🧩 Custom Provider';
   document.getElementById('ap-type-badge').textContent = 'openai';
   document.getElementById('ap-base-url').value = '';
   document.getElementById('ap-custom-envname').textContent = '—';
-  renderAddProviderModels([], []);
+  document.getElementById('ap-test-result').textContent = '';
+  renderApKeyList([]);
   document.getElementById('ap-keys-status').textContent = '';
   document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.';
   document.getElementById('addProviderStep1').style.display = 'none';
@@ -3216,53 +3303,84 @@ function onCustomProviderNameInput() {
   const name = document.getElementById('ap-custom-name').value.trim();
   document.getElementById('ap-custom-envname').textContent = name ? (name.toUpperCase() + '_KEYS') : '—';
   clearTimeout(apCustomNameDebounce);
-  if (!name) { document.getElementById('ap-keys-status').textContent = ''; document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.'; return; }
+  if (!name) {
+    document.getElementById('ap-keys-status').textContent = '';
+    document.getElementById('ap-keys-err').textContent = 'Provider ka naam daalo — keys uske env var se auto-detect hongi.';
+    renderApKeyList([]);
+    return;
+  }
   apCustomNameDebounce = setTimeout(() => refreshDetectedKeys(name, name.toUpperCase() + '_KEYS'), 350);
 }
 async function refreshDetectedKeys(name, envVar) {
-  const okEl = document.getElementById('ap-keys-status');
+  const statusEl = document.getElementById('ap-keys-status');
   const errEl = document.getElementById('ap-keys-err');
-  okEl.textContent = '🔍 checking ' + envVar + '…';
+  statusEl.textContent = '🔍 checking ' + envVar + '…';
   errEl.textContent = '';
+  renderApKeyList([]);
   const { res, data } = await api('/admin/providers/detect-keys?name=' + encodeURIComponent(name));
-  if (!res.ok) { okEl.textContent = ''; errEl.textContent = data.detail || 'Key detection failed'; return; }
+  if (!res.ok) { statusEl.textContent = ''; errEl.textContent = data.detail || 'Key detection failed'; return; }
   if (data.key_count > 0) {
-    okEl.textContent = `✅ ${data.key_count} key${data.key_count === 1 ? '' : 's'} detected from ${data.env_var} (${data.previews.join(', ')}) — sab ek hi base_url pe rotate hongi.`;
+    statusEl.textContent = `✅ ${data.key_count} key${data.key_count === 1 ? '' : 's'} detected from ${data.env_var} — jo use karni hain unhi ko select rehne do (default: sab).`;
+    renderApKeyList(data.keys);
   } else {
-    okEl.textContent = '';
+    statusEl.textContent = '';
     errEl.textContent = `⚠️ ${data.env_var} me koi key nahi mili. Host secrets me "${data.env_var}=key1,key2,..." add karke (multiple keys ek saath) dobara try karo.`;
   }
 }
-function renderAddProviderModels(models, checkedList) {
-  const box = document.getElementById('ap-models');
-  const checked = new Set(checkedList.length ? checkedList : models);
-  box.innerHTML = models.map(m => `
-    <label class="chip ${checked.has(m) ? 'checked' : ''}">
-      <input type="checkbox" value="${m.replace(/"/g, '&quot;')}" checked onchange="this.parentElement.classList.toggle('checked', this.checked)">
-      ${m}
-    </label>`).join('') || '<span class="muted">Koi default model nahi — neeche custom model ids daalo.</span>';
+function renderApKeyList(keys) {
+  apDetectedKeys = keys || [];
+  const box = document.getElementById('ap-keys-list');
+  box.innerHTML = apDetectedKeys.map(k => `
+    <label class="chip checked" style="width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" class="ap-key-cb" value="${k.index}" checked onchange="this.parentElement.classList.toggle('checked', this.checked)">
+      API Key ${k.index + 1}: <code style="background:transparent;font-size:12px">${k.preview}</code>
+    </label>`).join('');
+}
+function apCurrentNameType() {
+  const name = apSelected.isCustom ? document.getElementById('ap-custom-name').value.trim() : apSelected.name;
+  const type = apSelected.isCustom ? document.getElementById('ap-custom-type').value : apSelected.type;
+  return { name, type };
+}
+async function testAddProviderBaseUrl() {
+  const errEl = document.getElementById('ap-keys-err');
+  const resultEl = document.getElementById('ap-test-result');
+  errEl.textContent = '';
+  const { name, type } = apCurrentNameType();
+  const base_url = document.getElementById('ap-base-url').value.trim();
+  if (!name) { errEl.textContent = 'Provider name required'; return; }
+  const key_indices = Array.from(document.querySelectorAll('.ap-key-cb:checked')).map(i => parseInt(i.value, 10));
+  resultEl.className = 'muted';
+  resultEl.style.fontSize = '12px';
+  resultEl.textContent = '🧪 testing…';
+  const { res, data } = await api('/admin/providers/test-url', { method: 'POST', body: JSON.stringify({ name, type, base_url, key_indices }) });
+  if (!res.ok) { resultEl.textContent = ''; errEl.textContent = data.detail || 'Test failed'; return; }
+  resultEl.className = data.ok ? 'ok' : 'err';
+  resultEl.textContent = data.message;
 }
 async function submitNewProvider() {
   document.getElementById('ap-keys-err').textContent = '';
-  let name = apSelected.isCustom ? document.getElementById('ap-custom-name').value.trim() : apSelected.name;
-  const type = apSelected.isCustom ? document.getElementById('ap-custom-type').value : apSelected.type;
+  const { name, type } = apCurrentNameType();
   const base_url = document.getElementById('ap-base-url').value.trim();
   if (!name) { document.getElementById('ap-keys-err').textContent = 'Provider name required'; return; }
-  let models = Array.from(document.querySelectorAll('#ap-models input[type=checkbox]:checked')).map(i => i.value);
-  if (apSelected.isCustom) {
-    const extra = document.getElementById('ap-models-custom').value.split(',').map(s => s.trim()).filter(Boolean);
-    models = models.concat(extra);
+  const key_indices = Array.from(document.querySelectorAll('.ap-key-cb:checked')).map(i => parseInt(i.value, 10));
+  if (apDetectedKeys.length && !key_indices.length) {
+    document.getElementById('ap-keys-err').textContent = 'Kam se kam ek API key select karo';
+    return;
   }
-  if (!models.length) { document.getElementById('ap-keys-err').textContent = 'Kam se kam ek model chahiye'; return; }
   const enabled = document.getElementById('ap-enabled').checked;
   const btn = document.getElementById('ap-submit-btn');
-  btn.disabled = true; btn.textContent = 'Adding…';
+  btn.disabled = true; btn.textContent = 'Saving…';
   // NOTE: api_keys jaan-bujhke nahi bheja — backend seedha <NAME>_KEYS env var
-  // se keys pull karta hai. UI me kabhi key type/paste nahi hoti.
-  const { res, data } = await api('/admin/providers', { method: 'POST', body: JSON.stringify({ name, type, base_url, models, enabled }) });
-  btn.disabled = false; btn.textContent = '✅ Add Provider';
-  if (!res.ok) { document.getElementById('ap-keys-err').textContent = data.detail || 'Add failed'; return; }
-  document.getElementById('providers-ok').textContent = '✅ ' + data.message + (data.key_count !== undefined ? ' · ' + data.key_count + ' keys' : '');
+  // se saari keys pull karta hai; selected_keys sirf batata hai unme se kaunsi
+  // ACTUALLY is base_url pe use karni hain. Koi key kabhi type/paste nahi hoti.
+  const { res, data } = await api('/admin/providers', {
+    method: 'POST',
+    body: JSON.stringify({ name, type, base_url, enabled, selected_keys: key_indices }),
+  });
+  btn.disabled = false; btn.textContent = '💾 Save';
+  if (!res.ok) { document.getElementById('ap-keys-err').textContent = data.detail || 'Save failed'; return; }
+  const usedCount = key_indices.length || data.key_count;
+  document.getElementById('providers-ok').textContent = '✅ ' + data.message + (data.key_count !== undefined ? ' · ' + usedCount + '/' + data.key_count + ' keys in use' : '');
   closeAddProviderModal();
   await loadProvidersAdmin();
 }
