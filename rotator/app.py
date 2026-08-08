@@ -1363,11 +1363,11 @@ async def admin_providers(request: Request):
         config_providers[n] for n in all_names if n not in custom_names
     ] + [config_providers[n] for n in all_names if n in custom_names]
 
-    # sirf dashboard-se-managed providers dikhao — config.yaml ke default
-    # placeholder providers (0 keys, PASTE_ wale) hide. Env secrets se keys
-    # milne wale config providers (GEMINI_KEYS etc.) MUST show — user ko pata
-    # hona chahiye ki unki Render secrets detect hui hain.
-    ordered = [p for p in ordered if p.get("source") != "config" or p.get("key_count", 0) > 0]
+    # sirf "+ Add Provider" se add kiye hue providers dikhao — config.yaml ke
+    # default providers (zen/groq/openrouter...) aur runtime auto-detect wale
+    # ab Providers tab me NAHI dikhte. Add Provider modal hi provider setup ka
+    # proper rasta hai (base_url + keys + models sab wahan se).
+    ordered = [p for p in ordered if p.get("source") == "custom"]
 
     cache = _live_cache(request)
     status = []
@@ -2160,7 +2160,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .err { color:var(--red); font-size:13px; margin-top:8px; }
   .ok { color:var(--green); font-size:13px; margin-top:8px; }
   .modal { position:fixed; inset:0; z-index:100; background:rgba(0,0,0,.65); display:flex; align-items:center; justify-content:center; padding:16px; }
-  .modal-box { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:18px; width:min(620px,100%); max-height:86vh; display:flex; flex-direction:column; }
+  .modal-box { background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:18px; width:min(620px,100%); max-height:86vh; overflow-y:auto; display:flex; flex-direction:column; }
   .pick-item { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; cursor:pointer; border:1px solid var(--border); margin-bottom:6px; background:var(--panel2); font-size:13px; }
   .pick-item.on { border-color:var(--accent); }
   .pick-item input { accent-color:var(--accent); width:15px; height:15px; }
@@ -2368,7 +2368,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="muted" style="margin-bottom:10px">API keys sirf <b>env secrets</b> se aati hain (<b>GEMINI_KEYS</b>, <b>GROQ_KEYS</b>, <b>OPENROUTER_KEYS</b>, <b>NVIDIA_KEYS</b>, <b>ZEN_KEYS</b>, ...) — yahan UI me kabhi key type/paste nahi karni padti. "+ Add Provider" se ek provider select karo, base_url + detected keys apne aap dikh jayenge. Har provider card pe jo keys use karni hain unhi ko select karo — sab selected keys ek hi base_url pe automatically rotate hoti hain. Models yahan set nahi hote — woh <b>🎚 Exposed Models</b> tab se manage karo. 💾</div>
         <div style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="btn" onclick="openAddProviderModal()">➕ Add Provider</button>
-          <button class="btn sec" onclick="refreshProvidersLive()">🔄 Refresh Live Models</button>
         </div>
         <div class="err" id="providers-err"></div>
         <div class="ok" id="providers-ok"></div>
@@ -3215,12 +3214,6 @@ async function deleteProviderAdmin(name) {
   const { res, data } = await api('/admin/providers/' + encodeURIComponent(name), { method: 'DELETE' });
   if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Delete failed'; return; }
   document.getElementById('providers-ok').textContent = data.message;
-  await loadProvidersAdmin();
-}
-async function refreshProvidersLive() {
-  const { res, data } = await api('/admin/providers/refresh-all', { method: 'POST' });
-  if (!res.ok) { document.getElementById('providers-err').textContent = data.detail || 'Refresh failed'; return; }
-  document.getElementById('providers-ok').textContent = '✅ Live models refresh ho gaye';
   await loadProvidersAdmin();
 }
 async function resyncProviderKeys(name) {
