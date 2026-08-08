@@ -2421,7 +2421,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="ap-profiles-wrap" style="margin-top:14px">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
           <b style="font-size:13px">🔗 Profiles — alag-alag gateway URL per key group</b>
-          <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="addApProfile()">+ Add Profile</button>
+          <button class="btn" style="padding:3px 10px;font-size:12px" onclick="addApProfile()">➕ Add Profile</button>
         </div>
         <div class="muted" style="font-size:11px;margin-bottom:6px">Har profile ka apna base_url (jaise alag Cloudflare worker) + konse keys usme jayengi. Jo keys kisi profile me nahi, wo upar wale Base URL pe jaayengi.</div>
         <div id="ap-profiles-list"></div>
@@ -2441,6 +2441,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
         <button class="btn sec" onclick="closeAddProviderModal()">Cancel</button>
         <button class="btn" id="ap-submit-btn" onclick="submitNewProvider()">💾 Save</button>
+      </div>
+    </div>
+
+    <!-- STEP 3: Add Profile editor — is gateway pe base_url + konse keys jayengi -->
+    <div id="addProviderStep3" style="display:none">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+        <button class="btn sec" onclick="backToProviderSetup()">‹ Back</button>
+        <b id="ap-prof-title" style="font-size:15px"></b>
+      </div>
+
+      <label>Profile Base URL <span class="muted" style="font-size:11px">(is gateway pe jane wali keys ke liye)</span></label>
+      <input id="ap-prof-url" type="text" placeholder="https://worker.../gemini/v1beta">
+      <div style="margin-top:8px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <button class="btn sec" onclick="testApProfileUrl()">🧪 Test URL</button>
+        <span id="ap-prof-test-result" class="muted" style="font-size:12px"></span>
+      </div>
+
+      <div class="ok" id="ap-prof-keys-status" style="margin-top:12px"></div>
+      <div id="ap-prof-keys-list" style="margin-top:6px"></div>
+      <div class="err" id="ap-prof-keys-err"></div>
+
+      <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+        <button class="btn sec" onclick="backToProviderSetup()">Cancel</button>
+        <button class="btn" onclick="saveApProfile()">💾 Add Profile</button>
       </div>
     </div>
   </div>
@@ -2935,11 +2959,11 @@ function addGroup() {
 function removeMember(gi, mi) { modelsDraft.groups[gi].members.splice(mi, 1); renderGroupEditor(); }
 function addMember(gi) {
   const prov = modelsData.providers[0] || { name: '' };
-  const opts = providerModelOptions(prov.name);
   const pInfo = modelsData.providers.find(p => p.name === prov.name);
-  // default: saare models + saari keys select — taaki rotation me fallback mile
+  // default: models KHAALI — user manually pick karta hai (saare models pre-select nahi)
+  // keys saari select (kyunki "kuch nahi select = saari keys" convention hai backend me)
   const keyIdx = (pInfo && pInfo.keys || []).map(k => k.index);
-  modelsDraft.groups[gi].members.push({ provider: prov.name, models: opts.slice(), keys: keyIdx });
+  modelsDraft.groups[gi].members.push({ provider: prov.name, models: [], keys: keyIdx });
   renderGroupEditor();
 }
 function selectAllKeys(gi, mi) {
@@ -3124,6 +3148,17 @@ async function loadProvidersAdmin() {
   providersData = data;
   renderProviders();
 }
+// provider ke saare blocks: Profile 1 = main base_url, baaki = saved per-key gateways
+function getProviderBlocks(p) {
+  const keys = p.keys || [];
+  const keyUrl = {};
+  keys.forEach(k => { if (k.base_url) keyUrl[k.index] = k.base_url; });
+  const profUrls = Array.from(new Set(keys.map(k => k.base_url || '').filter(Boolean)));
+  return [
+    { label: 'Profile 1', url: p.base_url || '', isMain: true },
+    ...profUrls.map((u, i) => ({ label: 'Profile ' + (i + 2), url: u, isMain: false })),
+  ];
+}
 function renderProviders() {
   const box = document.getElementById('providers-list');
   const list = (providersData && providersData.providers) || [];
@@ -3132,15 +3167,29 @@ function renderProviders() {
     const isCustom = p.source === 'custom';
     const keys = p.keys || [];
     const selectedCount = keys.filter(k => k.selected !== false).length;
-    const keyRows = keys.map((k, ki) => {
-      const on = k.selected !== false;
-      return `
-      <div style="margin-bottom:8px">
-        <label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;width:100%;box-sizing:border-box;justify-content:flex-start">
-          <input type="checkbox" id="prov-ksel-${idx}-${ki}" ${on ? 'checked' : ''} onchange="toggleProviderKey(${idx})">
+    const blocks = getProviderBlocks(p);
+    // har block = ek profile: label + editable base_url + saari keys select/unselect
+    const blockHtml = blocks.map((b, bi) => {
+      const keyRows = keys.map((k, ki) => {
+        const isHome = b.isMain ? !(k.base_url) : (k.base_url === b.url);
+        const on = isHome && k.selected !== false;
+        return `
+        <label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:4px">
+          <input type="checkbox" class="prov-prof-pk" data-idx="${idx}" data-block="${bi}" data-ki="${ki}" ${on ? 'checked' : ''} onchange="setProfileKey(${idx}, ${bi}, ${ki}, this.checked)">
           🔑&nbsp;<code style="background:transparent;font-size:12px">${k.preview}</code>
-          <span class="muted" style="font-size:11px;margin-left:auto;max-width:55%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${k.base_url ? '🌐 ' + k.base_url : (on ? '✅ is base_url pe use ho rahi' : '⏸ use nahi ho rahi')}</span>
+        </label>`;
+      }).join('');
+      return `
+      <div style="border:1px solid var(--panel2);border-radius:8px;padding:10px;margin-bottom:10px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+          <b style="font-size:13px">${b.label}</b>
+          <span class="muted" style="font-size:11px">${b.isMain ? 'main gateway — jo keys kisi profile me nahi' : 'alag gateway (Cloudflare worker jaise)'}</span>
+        </div>
+        <label class="muted" style="font-size:12px">Base URL <span style="font-size:11px">${b.isMain ? '(selected keys isi URL pe rotate hongi)' : ''}</span>
+          <input id="${b.isMain ? 'prov-base-' + idx : 'prov-prof-url-' + idx + '-' + bi}" type="text" value="${(b.url || '').replace(/"/g, '&quot;')}" placeholder="empty = default" style="width:100%;margin-top:4px">
         </label>
+        <div class="muted" style="font-size:12px;margin-top:8px">Keys is profile me — select karo (ek key sirf ek profile me ho sakti hai):</div>
+        <div style="margin-top:4px">${keyRows || '<span class="muted">Koi key nahi — 🔁 Sync ya Add Provider se env se pull karo.</span>'}</div>
       </div>`;
     }).join('');
     return `
@@ -3153,20 +3202,13 @@ function renderProviders() {
         ${p.enabled ? '' : '<span class="badge" style="background:#f4433622;color:#f66;padding:2px 8px;border-radius:10px;font-size:12px">disabled</span>'}
       </div>
 
-      <label class="muted" style="font-size:12px">Base URL <span style="font-size:11px">(selected keys sab isi ek URL pe rotate hongi)</span>
-        <input id="prov-base-${idx}" type="text" value="${(p.base_url || '').replace(/"/g, '&quot;')}" placeholder="empty = default" style="width:100%;margin-top:4px">
-      </label>
-
-      <div class="muted" style="font-size:12px;margin-top:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <div class="muted" style="font-size:12px;margin-bottom:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span>Models: ${(p.models && p.models.length) ? p.models.length + ' exposed' : 'abhi koi expose nahi'}</span>
         <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="showView('exposed'); loadExposed();">🎚 Manage Models</button>
       </div>
 
-      <div style="margin-top:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-        <b style="font-size:13px">🔑 API Keys — is base_url pe rotate karne ke liye select karo</b>
-        <button class="btn sec" style="padding:3px 10px;font-size:12px" onclick="selectAllProviderKeys(${idx})">✅ Select all</button>
-      </div>
-      <div style="margin-top:6px">${keyRows || '<span class="muted">Koi key nahi — 🔁 Sync ya Add Provider se env se pull karo.</span>'}</div>
+      <div class="muted" style="font-size:13px;margin:10px 0 6px"><b>🔗 Profiles</b> <span style="font-size:11px">(har profile ka apna base_url + keys — edits ke baad 💾 Save dabao)</span></div>
+      ${blockHtml}
 
       <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <span class="muted" style="font-size:12px"><input id="prov-enabled-${idx}" type="checkbox" ${p.enabled ? 'checked' : ''}> enabled</span>
@@ -3177,17 +3219,16 @@ function renderProviders() {
     </div>`;
   }).join('');
 }
-async function toggleProviderKey(idx) {
-  // key ko check/uncheck karte hi turant save — alag se "Save" dabane ki zaroorat nahi.
-  await saveProviderAdmin(idx);
-}
-async function selectAllProviderKeys(idx) {
-  const p = providersData.providers[idx];
-  (p.keys || []).forEach((k, ki) => {
-    const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
-    if (cb) cb.checked = true;
+// key check/uncheck karte waqt: ek key ek hi profile me — dusre blocks se uncheck
+function setProfileKey(idx, blockIndex, ki, checked) {
+  document.querySelectorAll('.prov-prof-pk[data-idx="' + idx + '"][data-ki="' + ki + '"]').forEach(cb => {
+    if (cb.dataset.block !== String(blockIndex)) {
+      cb.checked = false;
+      cb.parentElement.classList.remove('checked');
+    } else {
+      cb.parentElement.classList.toggle('checked', cb.checked);
+    }
   });
-  await saveProviderAdmin(idx);
 }
 async function saveProviderAdmin(idx) {
   const p = providersData.providers[idx];
@@ -3196,13 +3237,31 @@ async function saveProviderAdmin(idx) {
   const keys = (p.keys || []);
   const selected_keys = [];
   const key_base_urls = {};
-  keys.forEach((k, ki) => {
-    const cb = document.getElementById('prov-ksel-' + idx + '-' + ki);
-    if (cb && cb.checked) selected_keys.push(ki);
-    // existing per-key base_url preserve (profiles se aaye) — card pe edit UI nahi,
-    // bas jo save hua hai wahi wapas bhejo warna profiles wipe ho jayengi
-    if (k.base_url) key_base_urls[ki] = k.base_url;
+  const blocks = getProviderBlocks(p);
+  let invalid = null;  // forEach ke andar return sirf callback rokta hai — isliye flag
+  // profile blocks ke checked keys se collect karo — main block ki keys base_url pe,
+  // baaki profiles ki keys apne-2 URLs pe. Ek key sirf ek jagah checked ho sakti hai.
+  document.querySelectorAll('.prov-prof-pk[data-idx="' + idx + '"]').forEach(cb => {
+    if (!cb.checked) return;
+    const bi = parseInt(cb.dataset.block, 10);
+    const ki = parseInt(cb.dataset.ki, 10);
+    const b = blocks[bi];
+    if (!b) return;
+    const urlEl = document.getElementById(b.isMain ? 'prov-base-' + idx : 'prov-prof-url-' + idx + '-' + bi);
+    const url = (urlEl ? urlEl.value : b.url || '').trim();
+    if (b.isMain) {
+      if (!url && p.type === 'openai') {
+        invalid = 'Profile 1 (main) ka base_url required hai — ya saari keys kisi profile me daalo';
+        return;
+      }
+    } else if (!url) {
+      invalid = b.label + ' ka base_url required hai — empty nahi chhod sakte';
+      return;
+    }
+    selected_keys.push(ki);
+    if (!b.isMain) key_base_urls[ki] = url;
   });
+  if (invalid) { document.getElementById('providers-err').textContent = invalid; return; }
   const body = {
     name: p.name,
     type: p.type,
@@ -3240,22 +3299,33 @@ let apPresets = [];
 let apSelected = null;      // { name, type, base_url, env_var, isCustom }
 let apDetectedKeys = [];    // [{index, preview}] — abhi ke provider ki detected keys
 let apProfiles = [];        // [{url, keyIndices:[]}] — per-key group gateway URLs
+let apSaved = null;         // already-added provider ka GET /admin/providers data (edit mode me profiles load karne ke liye)
+let apEditingProfile = -1;  // Step 3 me kaunsa profile edit ho raha hai (-1 = naya add)
 
-function openAddProviderModal() {
+async function openAddProviderModal() {
   document.getElementById('addProviderModal').style.display = 'flex';
   document.getElementById('addProviderStep1').style.display = '';
   document.getElementById('addProviderStep2').style.display = 'none';
+  // edit mode me profiles load karne ke liye providersData fresh hona zaroori hai —
+  // agar tab kholte hi modal khol diya (fetch abhi complete nahi hua), pehle load karo
+  if (!providersData) await loadProvidersAdmin();
   loadProviderCatalogPicker();
 }
 function closeAddProviderModal() {
   document.getElementById('addProviderModal').style.display = 'none';
+  document.getElementById('addProviderStep3').style.display = 'none';
   apProfiles = [];
+  apSaved = null;
+  apEditingProfile = -1;
   renderApProfiles();
 }
 function backToProviderPresets() {
   document.getElementById('addProviderStep1').style.display = '';
   document.getElementById('addProviderStep2').style.display = 'none';
+  document.getElementById('addProviderStep3').style.display = 'none';
   apProfiles = [];
+  apSaved = null;
+  apEditingProfile = -1;
   renderApProfiles();
 }
 async function loadProviderCatalogPicker() {
@@ -3279,11 +3349,30 @@ function selectProviderPreset(i) {
   const p = apPresets[i];
   apSelected = { name: p.name, type: p.type, base_url: p.base_url, env_var: p.env_var, isCustom: false };
   apProfiles = [];
+  apSaved = null;
+  apEditingProfile = -1;
+  document.getElementById('addProviderStep3').style.display = 'none';
   document.getElementById('ap-custom-name-wrap').style.display = 'none';
   document.getElementById('ap-name-label').textContent = p.icon + ' ' + p.label;
   document.getElementById('ap-type-badge').textContent = p.type;
-  document.getElementById('ap-base-url').value = p.base_url;
+  // already-added provider → saved base_url + profiles + key selection load karo.
+  // Warna: (a) saved base_url preset default pe reset ho jata, (b) profiles UI me
+  // nahi dikhti, aur (c) Save dabane par empty key_base_urls se profiles wipe ho jati.
+  const saved = ((providersData && providersData.providers) || []).find(x => x.name === p.name);
+  document.getElementById('ap-base-url').value = (saved && saved.base_url) || p.base_url;
   document.getElementById('ap-test-result').textContent = '';
+  if (saved) {
+    apSaved = saved;
+    // profiles: saved keys ke per-key base_url se group karke wapas banao
+    const urlToIndices = {};
+    (saved.keys || []).forEach(k => {
+      const u = (k.base_url || '').trim();
+      if (!u) return;
+      (urlToIndices[u] = urlToIndices[u] || []).push(k.index);
+    });
+    apProfiles = Object.entries(urlToIndices)
+      .map(([url, idxs]) => ({ url, keyIndices: idxs.sort((a, b) => a - b) }));
+  }
   refreshDetectedKeys(p.name, p.env_var);
   document.getElementById('addProviderStep1').style.display = 'none';
   document.getElementById('addProviderStep2').style.display = '';
@@ -3291,6 +3380,9 @@ function selectProviderPreset(i) {
 function selectCustomProviderPreset() {
   apSelected = { name: '', type: 'openai', base_url: '', env_var: '', isCustom: true };
   apProfiles = [];
+  apSaved = null;
+  apEditingProfile = -1;
+  document.getElementById('addProviderStep3').style.display = 'none';
   document.getElementById('ap-custom-name-wrap').style.display = '';
   document.getElementById('ap-custom-name').value = '';
   document.getElementById('ap-custom-type').value = 'openai';
@@ -3339,62 +3431,149 @@ async function refreshDetectedKeys(name, envVar) {
 }
 function renderApKeyList(keys) {
   apDetectedKeys = keys || [];
+  // edit mode (apSaved) me saved key selection restore karo — empty selected_keys
+  // matlab sab selected (router default). Pehle sab "checked" hota tha, jo edit pe
+  // galat selection dikhata tha.
+  const saved = apSaved;
+  const selSet = (saved && (saved.selected_keys || []).length) ? new Set(saved.selected_keys) : null;
+  const useAll = !selSet;
+  const savedKeyByIndex = {};
+  if (saved) (saved.keys || []).forEach(sk => { savedKeyByIndex[sk.index] = sk; });
   const box = document.getElementById('ap-keys-list');
-  box.innerHTML = apDetectedKeys.map(k => `
-    <label class="chip checked" style="width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" class="ap-key-cb" value="${k.index}" checked onchange="this.parentElement.classList.toggle('checked', this.checked)">
+  box.innerHTML = apDetectedKeys.map(k => {
+    const on = useAll || selSet.has(k.index);
+    const sk = savedKeyByIndex[k.index];
+    const urlHint = sk && sk.base_url ? `<span class="muted" style="font-size:11px;margin-left:auto;max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🌐 ${sk.base_url}</span>` : '';
+    return `
+    <label class="chip ${on ? 'checked' : ''}" style="width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" class="ap-key-cb" value="${k.index}" ${on ? 'checked' : ''} onchange="this.parentElement.classList.toggle('checked', this.checked)">
       API Key ${k.index + 1}: <code style="background:transparent;font-size:12px">${k.preview}</code>
-    </label>`).join('');
+      ${urlHint}
+    </label>`;
+  }).join('');
   renderApProfiles();
 }
 
 // ---- Profiles: har profile = apna gateway base_url + usme jane wali keys ----
+// Step 3 me Add/Edit — base_url + saari API keys (preview) select karo
 function addApProfile() {
-  apProfiles.push({ url: '', keyIndices: [] });
+  apEditingProfile = -1;
+  document.getElementById('ap-prof-title').textContent = '➕ Add Profile' + (apSelected && apSelected.name ? ' — ' + apSelected.name : '');
+  document.getElementById('ap-prof-url').value = '';
+  document.getElementById('ap-prof-keys-err').textContent = '';
+  document.getElementById('ap-prof-keys-status').textContent = '';
+  document.getElementById('ap-prof-test-result').textContent = '';
+  renderApProfileKeyList();
+  document.getElementById('addProviderStep2').style.display = 'none';
+  document.getElementById('addProviderStep3').style.display = '';
+}
+function editApProfile(pi) {
+  const prof = apProfiles[pi];
+  if (!prof) return;
+  apEditingProfile = pi;
+  document.getElementById('ap-prof-title').textContent = '✏️ Edit Profile ' + (pi + 1) + (apSelected && apSelected.name ? ' — ' + apSelected.name : '');
+  document.getElementById('ap-prof-url').value = prof.url || '';
+  document.getElementById('ap-prof-keys-err').textContent = '';
+  document.getElementById('ap-prof-keys-status').textContent = '';
+  document.getElementById('ap-prof-test-result').textContent = '';
+  renderApProfileKeyList();
+  document.getElementById('addProviderStep2').style.display = 'none';
+  document.getElementById('addProviderStep3').style.display = '';
+}
+function backToProviderSetup() {
+  document.getElementById('addProviderStep3').style.display = 'none';
+  document.getElementById('addProviderStep2').style.display = '';
   renderApProfiles();
+}
+function saveApProfile() {
+  const errEl = document.getElementById('ap-prof-keys-err');
+  errEl.textContent = '';
+  const url = document.getElementById('ap-prof-url').value.trim();
+  const keyIndices = Array.from(document.querySelectorAll('.ap-prof-key-cb:checked')).map(i => parseInt(i.value, 10)).sort((a, b) => a - b);
+  if (!url) { errEl.textContent = 'Profile ka base_url required hai'; return; }
+  if (!keyIndices.length) { errEl.textContent = 'Kam se kam ek API key select karo'; return; }
+  if (apEditingProfile >= 0) apProfiles[apEditingProfile] = { url, keyIndices };
+  else apProfiles.push({ url, keyIndices });
+  // profile me select ki gayi keys active bhi banao (main key list me check)
+  keyIndices.forEach(ki => {
+    const cb = document.querySelector('.ap-key-cb[value="' + ki + '"]');
+    if (cb) { cb.checked = true; cb.parentElement.classList.add('checked'); }
+  });
+  apEditingProfile = -1;
+  backToProviderSetup();
+}
+async function testApProfileUrl() {
+  // Step 3 — profile ka base_url + selected keys se live test (Save se pehle)
+  const errEl = document.getElementById('ap-prof-keys-err');
+  const resultEl = document.getElementById('ap-prof-test-result');
+  errEl.textContent = '';
+  const url = document.getElementById('ap-prof-url').value.trim();
+  const keyIndices = Array.from(document.querySelectorAll('.ap-prof-key-cb:checked')).map(i => parseInt(i.value, 10));
+  if (!url) { errEl.textContent = 'Profile ka base_url required hai'; return; }
+  const { name, type } = apCurrentNameType();
+  if (!name) { errEl.textContent = 'Provider name required'; return; }
+  resultEl.className = 'muted';
+  resultEl.style.fontSize = '12px';
+  resultEl.textContent = '🧪 testing…';
+  const { res, data } = await api('/admin/providers/test-url', { method: 'POST', body: JSON.stringify({ name, type, base_url: url, key_indices: keyIndices }) });
+  if (!res.ok) { resultEl.textContent = ''; errEl.textContent = data.detail || 'Test failed'; return; }
+  resultEl.className = data.ok ? 'ok' : 'err';
+  resultEl.textContent = data.message;
+}
+function renderApProfileKeyList() {
+  const box = document.getElementById('ap-prof-keys-list');
+  const statusEl = document.getElementById('ap-prof-keys-status');
+  statusEl.textContent = '';
+  if (!apDetectedKeys.length) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">Koi API key detected nahi — env me <code>' + ((apSelected && apSelected.env_var) || 'NAME_KEYS') + '</code> set karke provider dobara select karo.</div>';
+    return;
+  }
+  const cur = (apEditingProfile >= 0) ? (apProfiles[apEditingProfile].keyIndices || []) : [];
+  const selSet = new Set(cur);
+  box.innerHTML = apDetectedKeys.map(k => {
+    const on = selSet.has(k.index);
+    return `
+    <label class="chip ${on ? 'checked' : ''}" style="width:100%;box-sizing:border-box;justify-content:flex-start;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" class="ap-prof-key-cb" value="${k.index}" ${on ? 'checked' : ''} onchange="this.parentElement.classList.toggle('checked', this.checked)">
+      API Key ${k.index + 1}: <code style="background:transparent;font-size:12px">${k.preview}</code>
+    </label>`;
+  }).join('');
 }
 function removeApProfile(pi) {
   apProfiles.splice(pi, 1);
   renderApProfiles();
 }
-function updateApProfileKey(pi, ki, checked) {
-  const prof = apProfiles[pi];
-  if (!prof) return;
-  const set = new Set(prof.keyIndices);
-  if (checked) set.add(ki); else set.delete(ki);
-  prof.keyIndices = Array.from(set).sort((a, b) => a - b);
-}
 function renderApProfiles() {
   const list = document.getElementById('ap-profiles-list');
   if (!list) return;
   if (!apProfiles.length) {
-    list.innerHTML = '<div class="muted" style="font-size:12px">Koi profile nahi — saari keys upar wale Base URL pe chalengi. "+ Add Profile" se alag gateway add karo.</div>';
+    list.innerHTML = '<div class="muted" style="font-size:12px">Koi profile nahi — saari keys upar wale Base URL pe chalengi. "➕ Add Profile" se alag gateway add karo.</div>';
     return;
   }
-  list.innerHTML = apProfiles.map((prof, pi) => `
+  list.innerHTML = apProfiles.map((prof, pi) => {
+    const keyTags = (prof.keyIndices || []).map(ki => {
+      const dk = apDetectedKeys.find(x => x.index === ki);
+      return `<span class="tag">key ${ki + 1}${dk ? ' · ' + dk.preview : ''}</span>`;
+    }).join('');
+    return `
     <div style="border:1px solid var(--panel2);border-radius:8px;padding:8px;margin-bottom:8px">
       <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
         <b style="font-size:12px">Profile ${pi + 1}</b>
-        <input id="ap-prof-url-${pi}" type="text" value="${(prof.url || '').replace(/"/g, '&quot;')}" placeholder="https://worker.../gemini/v1beta" style="flex:1;min-width:200px">
+        <code style="background:transparent;font-size:11px;flex:1;min-width:150px;word-break:break-all">${(prof.url || '').replace(/"/g, '&quot;')}</code>
+        <button class="btn sec" style="padding:3px 8px;font-size:11px" onclick="editApProfile(${pi})">✏️</button>
         <button class="btn sec" style="padding:3px 8px;font-size:11px" onclick="removeApProfile(${pi})">🗑</button>
       </div>
-      <div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">
-        ${apDetectedKeys.map(k => {
-          const on = prof.keyIndices.includes(k.index);
-          return `<label class="chip ${on ? 'checked' : ''}" style="cursor:pointer;padding:3px 8px;font-size:12px">
-            <input type="checkbox" class="ap-prof-key" value="${k.index}" data-pi="${pi}" ${on ? 'checked' : ''} onchange="this.parentElement.classList.toggle('checked', this.checked); updateApProfileKey(parseInt(this.dataset.pi,10), parseInt(this.value,10), this.checked)">
-            key ${k.index + 1}</label>`;
-        }).join('')}
-      </div>
-    </div>`).join('');
+      ${keyTags ? `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">${keyTags}</div>` : ''}
+    </div>`;
+  }).join('');
 }
 function collectApKeyBaseUrls() {
   // {index: url} — profile me diye gaye URLs ko key index se map karo
   const out = {};
-  apProfiles.forEach((prof, pi) => {
-    const url = (document.getElementById('ap-prof-url-' + pi).value || '').trim();
+  apProfiles.forEach(prof => {
+    const url = (prof.url || '').trim();
     if (!url) return;
-    prof.keyIndices.forEach(ki => { out[ki] = url; });
+    (prof.keyIndices || []).forEach(ki => { out[ki] = url; });
   });
   return out;
 }
@@ -3428,6 +3607,24 @@ async function submitNewProvider() {
   if (apDetectedKeys.length && !key_indices.length) {
     document.getElementById('ap-keys-err').textContent = 'Kam se kam ek API key select karo';
     return;
+  }
+  // safety: edit mode me agar apSaved null hai (providersData stale tha, profiles
+  // load nahi hui) aur provider already exists, toh existing key_base_urls preserve
+  // karo — warna empty profiles se saved profiles accidentally wipe ho jati.
+  // (Jab apSaved set hota hai toh empty apProfiles = user ne jaan-bujhke delete
+  // kiya, isliye wahan yeh guard nahi chalta.)
+  if (!apSaved) {
+    const existing = ((providersData && providersData.providers) || []).find(x => x.name === name);
+    if (existing && (existing.key_base_urls && Object.keys(existing.key_base_urls).length)) {
+      const urlToIndices = {};
+      (existing.keys || []).forEach(k => {
+        const u = (k.base_url || '').trim();
+        if (!u) return;
+        (urlToIndices[u] = urlToIndices[u] || []).push(k.index);
+      });
+      apProfiles = Object.entries(urlToIndices)
+        .map(([url, idxs]) => ({ url, keyIndices: idxs.sort((a, b) => a - b) }));
+    }
   }
   const enabled = document.getElementById('ap-enabled').checked;
   const btn = document.getElementById('ap-submit-btn');
