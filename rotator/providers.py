@@ -764,13 +764,23 @@ class GeminiProvider(Provider):
         for t in tools:
             fn = (t.get("function") or {}) if isinstance(t, dict) else {}
             parameters = fn.get("parameters") or {"type": "object", "properties": {}}
+            params = GeminiProvider._sanitize_gemini_schema(parameters)
+            # OpenAI/AI SDK (opencode) ke schemas me `required` me aisi
+            # property ho sakti hai jo `properties` me defined NAHI hai.
+            # Gemini ise 400 deta hai ("required[0]: property is not
+            # defined") — filter karo, warna saare providers fail dikhte hain.
+            props = params.get("properties") or {}
+            if isinstance(props, dict) and isinstance(params.get("required"), list):
+                params["required"] = [r for r in params["required"] if r in props]
+                if not params["required"]:
+                    params.pop("required", None)
             declarations.append(
                 {
                     "name": fn.get("name", ""),
                     "description": fn.get("description", ""),
                     # Pydantic schemas ($schema, exclusiveMinimum...) ko
                     # Gemini-compatible banao — warna 400 + sab providers fail.
-                    "parameters": GeminiProvider._sanitize_gemini_schema(parameters),
+                    "parameters": params,
                 }
             )
         return [{"functionDeclarations": declarations}]
