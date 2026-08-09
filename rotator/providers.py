@@ -778,10 +778,27 @@ class GeminiProvider(Provider):
                     response = json.loads(msg.content)  # already JSON hai toh rakh lo
                 except (json.JSONDecodeError, TypeError):
                     pass
+                # Gemini ko functionResponse.name REQUIRED hai. OpenAI clients
+                # (opencode/AI SDK, curl, ChatGPT-style) tool message me `name`
+                # nahi bhejte — sirf tool_call_id. Toh name ko isse pehle ke
+                # assistant functionCall se map karo, warna Gemini 400 dega
+                # ("Name cannot be empty") aur sab providers exhausted dikhenge.
+                fname = msg.name
+                if not fname:
+                    for prev in contents:
+                        for part in prev.get("parts", []):
+                            fc = part.get("functionCall")
+                            if fc and fc.get("name"):
+                                fname = fc["name"]
+                                break
+                        if fname:
+                            break
+                if not fname:
+                    fname = "tool_call"
                 parts.append(
                     {
                         "functionResponse": {
-                            "name": msg.name,
+                            "name": fname,
                             "response": {"result": response},
                         }
                     }
