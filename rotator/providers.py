@@ -688,74 +688,147 @@ class GeminiProvider(Provider):
 
     @staticmethod
     def _sanitize_gemini_schema(schema):
-        """Pydantic/OpenAI-style JSON Schema → Gemini-compatible schema.
+        """Pydantic/OpenAI/AI-SDK-style JSON Schema → Gemini-compatible schema.
 
-        Gemini function parameters me JSON Schema ka subset support karta hai.
-        Pydantic-generated schemas me `$schema`, `exclusiveMinimum`,
-        `title`, `default` jaise keywords aate hain — Gemini inhe dekhte hi
-        poora request 400 karke reject kar deta hai ("Cannot find field").
-        Isliye unsupported keywords hatao / convert karo (recursively).
+        Gemini function parameters me JSON Schema ka SUBSET support karta hai.
+        AI SDK (opencode), Pydantic, aur tools saare tarah ke keywords bhejte
+        hain — Gemini inhe dekhte hi poora request 400 karke reject kar deta
+        hai ("Cannot find field" / "property is not defined"). Isliye:
+          - whitelist approach: sirf Gemini-supported keywords rakho
+          - `$ref`/`$defs` resolve karo (Pydantic schemas ka common pattern)
+          - `allOf` merge karo, `anyOf`/`oneOf` nullable-simplify karo
+          - `required` me undefined property filter karo
         """
-        if isinstance(schema, list):
-            return [GeminiProvider._sanitize_gemini_schema(s) for s in schema]
-        if not isinstance(schema, dict):
-            return schema
+        ALLOWED = {
+            "type", "properties", "items", "required", "enum",
+            "description", "minimum", "maximum",
+        }
 
-        out: dict = {}
-        for key, value in schema.items():
-            if key == "$schema":
-                continue  # Gemini: Cannot find field
-            if key == "title":
-                continue  # Gemini me support nahi
-            if key == "default":
-                continue  # default bhi reject hota hai
-            if key == "examples":
-                continue
-            if key == "const":
-                continue
-            if key == "multipleOf":
-                continue
-            if key == "additionalProperties":
-                continue  # Gemini function params me support nahi
-            if key in ("pattern", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"):
-                continue  # Gemini support nahi karta (reject hota hai)
-            if key == "exclusiveMinimum":
-                # Gemini sirf minimum/maximum jaanta hai — exclusive ko
-                # approximate karo (integer schemas ke liye +1/-1 exact hai)
-                try:
-                    bound = int(value)
-                except (TypeError, ValueError):
+        def _sanitize(s: object, defs: dict, depth: int = 0) -> object:
+            if depth > 8:
+                # self-referencing schemas (recursive $ref loops) — guard
+                return {}
+            if isinstance(s, list):
+                return [_sanitize(x, defs, depth + 1) for x in s]
+            if not isinstance(s, dict):
+                return s
+
+            # $defs/definitions collect karo (root/any level) — $ref resolve ke liye
+            for k in ("$defs", "definitions"):
+                v = s.get(k)
+                if isinstance(v, dict):
+                    defs.update(v)
+
+            out: dict = {}
+
+            # `allOf` merge — Pydantic/OpenAI common: allOf[{a},{b}]
+            allof = s.get("allOf")
+            if isinstance(allof, list):
+                merged_props: dict = {}
+                merged_required: list = []
+                merged_type: object = None
+                for sub in allof:
+                    if not isinstance(sub, dict):
+                        continue
+                    sub2 = _sanitize(sub, defs, depth + 1)
+                    if not isinstance(sub2, dict):
+                        continue
+                    if isinstance(sub2.get("properties"), dict):
+                        merged_props.update(sub2["properties"])
+                    for r in sub2.get("required") or []:
+                        if r not in merged_required:
+                            merged_required.append(r)
+                    merged_type = merged_type or sub2.get("type")
+                if merged_props:
+                    out["properties"] = merged_props
+                if merged_required:
+                    out["required"] = merged_required
+                if merged_type:
+                    out["type"] = merged_type
+
+            for key, value in s.items():
+                # unsupported keywords — Gemini reject karta hai
+                if key in (
+                    "$schema", "$defs", "definitions", "allOf", "if", "then", "else",
+                    "not", "title", "default", "examples", "const", "multipleOf",
+                    "additionalProperties", "patternProperties", "pattern",
+                    "minLength", "maxLength", "minItems", "maxItems",
+                    "minProperties", "maxProperties", "uniqueItems", "contains",
+                    "propertyNames", "format", "deprecated", "readOnly", "writeOnly",
+                ):
                     continue
-                if "minimum" not in out:
-                    out["minimum"] = bound + 1
-                continue
-            if key == "exclusiveMaximum":
-                try:
-                    bound = int(value)
-                except (TypeError, ValueError):
+                if key == "$ref":
+                    # Pydantic `$ref: "#/$defs/Options"` → defs se inline karo
+                    name = str(value).rsplit("/", 1)[-1] if isinstance(value, str) else ""
+                    if name in defs:
+                        return _sanitize(defs[name], defs, depth + 1)
+                    continue  # unresolved ref → drop (schemas optional ho jaate hain)
+                if key == "exclusiveMinimum":
+                    # Gemini sirf minimum/maximum jaanta hai — exclusive ko
+                    # approximate karo (integer schemas ke liye +1/-1 exact hai)
+                    try:
+                        bound = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if "minimum" not in out:
+                        out["minimum"] = bound + 1
                     continue
-                if "maximum" not in out:
-                    out["maximum"] = bound - 1
-                continue
-            if key in ("anyOf", "oneOf"):
-                # Pydantic nullable = anyOf[{T}, {null}] → base type rakho
-                variants = [v for v in (value or []) if isinstance(v, dict)]
-                non_null = [v for v in variants if v.get("type") != "null"]
-                if len(non_null) == 1:
-                    merged = dict(non_null[0])
-                    out.update(GeminiProvider._sanitize_gemini_schema(merged))
+                if key == "exclusiveMaximum":
+                    try:
+                        bound = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if "maximum" not in out:
+                        out["maximum"] = bound - 1
                     continue
-                # complex union — Gemini support nahi karta, optional banao
-                out["type"] = "string"
-                out["description"] = "union type (simplified)"
-                continue
-            # Kisi bhi nested dict/list me recurse karo — property values,
-            # items, definitions sab schemas hote hain (idempotent sanitizer).
-            if isinstance(value, (dict, list)):
-                out[key] = GeminiProvider._sanitize_gemini_schema(value)
-            else:
+                if key in ("anyOf", "oneOf"):
+                    # Pydantic nullable = anyOf[{T}, {null}] → base type rakho
+                    variants = [v for v in (value or []) if isinstance(v, dict)]
+                    non_null = [v for v in variants if v.get("type") != "null"]
+                    if len(non_null) == 1:
+                        merged = dict(non_null[0])
+                        out.update(_sanitize(merged, defs, depth + 1))
+                        continue
+                    # complex union — Gemini support nahi karta, optional banao
+                    out["type"] = "string"
+                    out["description"] = "union type (simplified)"
+                    continue
+                # container keywords — schema-like values, special handling
+                if key == "properties":
+                    if isinstance(value, dict):
+                        out["properties"] = {
+                            name: _sanitize(sub, defs, depth + 1)
+                            for name, sub in value.items()
+                            if isinstance(sub, (dict, list)) or sub is None
+                        }
+                    continue
+                if key == "items":
+                    if isinstance(value, dict):
+                        out["items"] = _sanitize(value, defs, depth + 1)
+                    elif isinstance(value, list):
+                        # tuple validation (rare) — pehle wala schema le lo
+                        out["items"] = _sanitize(value[0], defs, depth + 1) if value else {}
+                    continue
+                # whitelist: sirf Gemini-supported keywords
+                if key not in ALLOWED:
+                    continue
                 out[key] = value
-        return out
+
+            # required me sirf defined properties rakho — Gemini "property is
+            # not defined" 400 deta hai undefined reference pe (opencode/AI SDK
+            # ka common pattern: required me property jo properties me nahi).
+            props = out.get("properties")
+            if isinstance(props, dict) and isinstance(out.get("required"), list):
+                out["required"] = [r for r in out["required"] if r in props]
+                if not out["required"]:
+                    out.pop("required", None)
+
+            # khaali schema → Gemini ko at least type chahiye
+            if not out:
+                out = {"type": "object"}
+            return out
+
+        return _sanitize(schema, {})
 
     @staticmethod
     def _to_gemini_tools(tools: list[dict]) -> list[dict]:
