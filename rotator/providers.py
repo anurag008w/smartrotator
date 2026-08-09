@@ -529,13 +529,34 @@ class GeminiProvider(Provider):
             elif search_tools and not function_tools and not tool_choice:
                 # sirf search grounding — koi functionConfig mat bhejo
                 tool_choice = None
-        # Gemini me tool_choice ka native equivalent nahi hai —
-        # "any" chahiye toh function_calling_config use hota hai.
-        # SIRF function tools hote tab bhejo (search grounding ke saath
-        # mode=ANY function bhi force kar dega, search ko daba kar).
+        # Gemini me tool_choice ka native equivalent —
+        # OpenAI: "auto" | "required" | "none" (string) ya {type: function}
+        # Gemini:  AUTO  | ANY        | NONE   (functionCallingConfig mode)
+        # IMPORTANT: opencode/AI-SDK default `tool_choice: "auto"` bhejta
+        # hai. Isse mode=ANY banana GALAT hai — wo model ko FORCE karta hai
+        # har baar koi na koi tool call karne ke liye (chahe zarurat ho ya
+        # nahi). "auto" → AUTO (model khud decide kare) hona chahiye.
         if tool_choice and any(not is_web_search_tool(t) for t in (tools or [])):
+            mode = "AUTO"
+            allowed: list = []
+            if isinstance(tool_choice, str):
+                tc = tool_choice.lower()
+                if tc == "none":
+                    mode = "NONE"
+                elif tc in ("required", "any"):
+                    mode = "ANY"
+                elif tc == "auto":
+                    mode = "AUTO"
+            elif isinstance(tool_choice, dict):
+                # OpenAI style: {"type": "function", "function": {"name": "foo"}}
+                fn = (tool_choice.get("function") or {}).get("name")
+                if fn:
+                    mode = "ANY"
+                    allowed = [fn]
+                else:
+                    mode = "AUTO"
             body["toolConfig"] = {
-                "functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": []}
+                "functionCallingConfig": {"mode": mode, "allowedFunctionNames": allowed}
             }
 
         url = f"{self.base_url}/models/{model}:generateContent"
