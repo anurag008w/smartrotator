@@ -532,7 +532,10 @@ class GeminiProvider(Provider):
             # background memory summaries (default)
             thinking_cfg["thinkingBudget"] = 4096
         elif effort == "high":
-            # deep thinking — jab user explicitly high select kare
+            # user ne high select kiya
+            thinking_cfg["thinkingBudget"] = 8192
+        elif effort == "max":
+            # maximum deep thinking
             thinking_cfg["thinkingBudget"] = 16384
         body["generationConfig"]["thinkingConfig"] = thinking_cfg
         # Gemini mapping — models ki real power (jo params Gemini support karta hai)
