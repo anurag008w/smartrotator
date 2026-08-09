@@ -506,6 +506,12 @@ class GeminiProvider(Provider):
             "maxOutputTokens": max_tokens,
             "temperature": temperature,
         }
+        # Gemini thinking/reasoning output (`thought: true` parts) default me
+        # response me NAHI aata — `includeThoughts: true` karna padta hai.
+        # Isi se opencode/client ko `reasoning_content` (thinking) milta hai.
+        # Kuch models is param ko 400 de sakte hain — HTTPStatusError handler
+        # me bina thinkingConfig ke retry hota hai (neeche dekho).
+        body["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
         # Gemini mapping — models ki real power (jo params Gemini support karta hai)
         if top_p is not None:
             body["generationConfig"]["topP"] = top_p
@@ -617,6 +623,32 @@ class GeminiProvider(Provider):
                 reasoning_content=reasoning,
             )
         except httpx.HTTPStatusError as exc:
+            # kuch Gemini models `thinkingConfig.includeThoughts` support nahi
+            # karte (400 "Invalid JSON payload" / "unknown field") — bina
+            # thinkingConfig ke ek baar retry karo taaki model kaam kare
+            # (sirf reasoning_content miss hoga, content milega).
+            if (
+                exc.response.status_code == 400
+                and body.get("generationConfig", {}).get("thinkingConfig", {}).get("includeThoughts")
+            ):
+                body["generationConfig"].pop("thinkingConfig", None)
+                try:
+                    resp = await http.post(url, headers=headers, params=params, json=body)
+                    resp.raise_for_status()
+                    data = self._parse_json_response(resp, self.name)
+                    self._check_error_body(data, self.name)
+                    return ChatResult(
+                        text=self._extract_text(data),
+                        provider=self.name,
+                        model=model,
+                        key_label="gemini",
+                        usage=data.get("usageMetadata", {}),
+                        raw=data,
+                        tool_calls=self._extract_tool_calls(data),
+                        reasoning_content=self._extract_thoughts(data),
+                    )
+                except httpx.HTTPStatusError as exc2:
+                    raise self._map_error(exc2, self.name) from exc2
             raise self._map_error(exc, self.name) from exc
         except httpx.HTTPError as exc:
             raise self._map_network(exc, self.name) from exc
