@@ -515,28 +515,32 @@ class GeminiProvider(Provider):
         # Gemini thinking/reasoning output (`thought: true` parts) default me
         # response me NAHI aata — `includeThoughts: true` karna padta hai.
         # Isi se opencode/client ko `reasoning_content` (thinking) milta hai.
-        # User/client `reasoning_effort` (low|medium|high) se thinking budget
-        # bhi control kar sakta hai — OpenAI-compatible standard field:
-        #   low    → chhota budget (fast, halka thinking)
-        #   medium → default-ish budget
-        #   high   → bada budget (deep thinking)
-        #   None   → includeThoughts true, budget model apne default pe
-        # Kuch models thinkingConfig ko 400 de sakte hain — HTTPStatusError
-        # handler me bina thinkingConfig ke retry hota hai (neeche dekho).
+        # User/client `reasoning_effort` (low|medium|high) se thinking control
+        # kar sakta hai — OpenAI-compatible standard field. Google ke docs
+        # (2026) ke mutabik:
+        #   - Gemini 3.x (3.5-flash, 3-flash-preview, ...) → `thinkingLevel`
+        #     use karte hain (minimal|low|medium|high); `thinkingBudget` 400
+        #     de sakta hai / unexpected performance. Default level = "medium"
+        #     (3.5-flash) ya "high" (3.1-pro).
+        #   - Gemini 2.5 series → `thinkingLevel` NAHI maante, `thinkingBudget`
+        #     maante hain (range 0–24576; -1 = dynamic).
+        #   - Dono ek saath bhejna = 400 error.
+        #   - reasoning_effort na diya ho → sirf includeThoughts: true bhejo,
+        #     model apni dynamic default thinking pe chalta hai (natural).
+        is_gemini3 = model.startswith(("gemini-3", "gemini-4"))
         thinking_cfg: dict = {"includeThoughts": True}
         effort = (reasoning_effort or "").strip().lower()
-        if effort == "low":
-            # chat replies + tool decisions (default toolThinking)
-            thinking_cfg["thinkingBudget"] = 2048
-        elif effort == "medium":
-            # background memory summaries (default)
-            thinking_cfg["thinkingBudget"] = 4096
-        elif effort == "high":
-            # user ne high select kiya
-            thinking_cfg["thinkingBudget"] = 8192
-        elif effort == "max":
-            # maximum deep thinking
-            thinking_cfg["thinkingBudget"] = 16384
+        if effort and effort != "auto":
+            if is_gemini3:
+                # Gemini 3 categorical levels — OpenAI effort map karo
+                level = {"low": "low", "medium": "medium", "high": "high", "max": "high"}.get(effort)
+                if level:
+                    thinking_cfg["thinkingLevel"] = level
+            else:
+                # Gemini 2.5 token budget — soft target, hard cap nahi
+                budget = {"low": 2048, "medium": 4096, "high": 8192, "max": 16384}.get(effort)
+                if budget:
+                    thinking_cfg["thinkingBudget"] = budget
         body["generationConfig"]["thinkingConfig"] = thinking_cfg
         # Gemini mapping — models ki real power (jo params Gemini support karta hai)
         if top_p is not None:
@@ -617,17 +621,17 @@ class GeminiProvider(Provider):
             # Reasoning model (gemini-3.x-flash etc.) ne saara token budget
             # thinking me kha liya → reply empty ya truncated aata hai
             # (thoughtsTokenCount bada, text "" ya MAX_TOKENS pe ruk gaya).
-            # User ko reasoning_content (thinking) bhi chahiye, isliye thinking
-            # band karne ke bajaye budget KAM karke retry karo — answer aayega
-            # AUR reasoning bhi preserve rahegi. Kuch models (3.6-flash)
-            # thinkingConfig hi 400 dete hain → tab bina thinkingConfig retry.
+            # Reasoning model ne token budget thinking me kha liya → reply
+            # truncated (MAX_TOKENS) ya khali. Thinking ko kabhi kill mat karo
+            # (user ko reasoning_content chahiye) — bas maxOutputTokens badha
+            # ke retry karo taaki thinking + answer dono fit ho jayen.
             if (not text.strip() and not tool_calls) or (thoughts > 0 and finish_reason == "MAX_TOKENS"):
                 original_reasoning = reasoning
                 try:
-                    tc = body["generationConfig"].setdefault("thinkingConfig", {})
-                    current_budget = tc.get("thinkingBudget") or 4096
-                    # thinking kam karke answer ke liye jagah banao
-                    tc["thinkingBudget"] = min(current_budget, 2048)
+                    gen = body["generationConfig"]
+                    current = int(gen.get("maxOutputTokens") or 8192)
+                    # thinking + answer dono ke liye jagah — 2x tak badao
+                    gen["maxOutputTokens"] = min(current * 2, 65536)
                     resp2 = await http.post(
                         url, headers=headers, params=params, json=body
                     )
