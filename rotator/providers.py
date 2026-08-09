@@ -403,6 +403,15 @@ class OpenAICompatibleProvider(Provider):
             "Content-Type": "application/json",
         }
 
+        # GAS (Google Apps Script) web app special: client ke HTTP headers
+        # upstream tak NAHI pahunchte (GAS ki limitation). Isliye jab endpoint
+        # GAS ka ho, auth ko URL query param (`auth=`) me bhejo — GAS script
+        # usse utha kar upstream ke liye Authorization header bana deta hai.
+        if "script.google.com" in endpoint:
+            sep = "&" if "?" in endpoint else "?"
+            endpoint = f"{endpoint}{sep}auth={quote(headers['Authorization'])}"
+            headers.pop("Authorization", None)
+
         client = self._proxy_client(proxy)
         try:
             http = client or self._client
