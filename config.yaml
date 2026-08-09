@@ -93,6 +93,9 @@ providers:
   - name: zen
     type: openai
     base_url: https://opencode.ai/zen/v1
+    # OpenCode Zen `Bearer` prefix REJECT karta hai — sirf raw key accept
+    # karta hai (Authorization: sk-...). Isliye auth_bearer: false.
+    auth_bearer: false
     models:
       - big-pickle
       - glm-5.2

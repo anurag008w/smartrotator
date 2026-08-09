@@ -258,7 +258,14 @@ class Provider:
 # OpenAI-compatible provider (Groq, OpenRouter, OpenCode Zen, ...)
 # --------------------------------------------------------------------------
 class OpenAICompatibleProvider(Provider):
-    def __init__(self, name: str, base_url: str, models: list[str], web_search_passthrough: bool = False):
+    def __init__(
+        self,
+        name: str,
+        base_url: str,
+        models: list[str],
+        web_search_passthrough: bool = False,
+        auth_bearer: bool = True,
+    ):
         super().__init__(models)
         self.name = name
         # top-level base_url optional ho sakta hai — jab har key ka apna
@@ -268,6 +275,10 @@ class OpenAICompatibleProvider(Provider):
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.endpoint = f"{self.base_url}/chat/completions" if self.base_url else None
         self.web_search_passthrough = web_search_passthrough
+        # kuch gateways (OpenCode Zen) `Bearer` prefix reject karte hain —
+        # sirf raw key accept karte hain. config me `auth_bearer: false`
+        # laga ke unke liye plain Authorization header bhejo.
+        self.auth_bearer = auth_bearer
 
     async def chat(
         self,
@@ -337,7 +348,7 @@ class OpenAICompatibleProvider(Provider):
         if tool_choice:
             payload["tool_choice"] = tool_choice
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {api_key}" if self.auth_bearer else api_key,
             "Content-Type": "application/json",
         }
 
@@ -916,6 +927,7 @@ def build_provider(
     base_url: str | None,
     models: list[str],
     web_search_passthrough: bool = False,
+    auth_bearer: bool = True,
 ) -> Provider:
     if ptype == "gemini":
         # custom base_url (Cloudflare Worker gateway / proxy / alt endpoint)
@@ -926,7 +938,13 @@ def build_provider(
         # base_url hai (Cloudflare Worker jaisa gateway), provider-wide
         # default ki zaroorat nahi. Missing endpoint ka actual check
         # request-time pe OpenAICompatibleProvider.chat() karta hai.
-        return OpenAICompatibleProvider(name, base_url or "", models, web_search_passthrough=web_search_passthrough)
+        return OpenAICompatibleProvider(
+            name,
+            base_url or "",
+            models,
+            web_search_passthrough=web_search_passthrough,
+            auth_bearer=auth_bearer,
+        )
     raise ValueError(f"provider '{name}': unknown type '{ptype}'")
 
 

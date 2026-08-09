@@ -52,6 +52,7 @@ class ProviderConfig:
     rpm_limit: int = 0
     rpd_limit: int = 0
     web_search_passthrough: bool = False
+    auth_bearer: bool = True
 
 
 class ProviderState:
@@ -170,6 +171,7 @@ class Rotator:
                 rpm_limit=int(cfg.get("rpm_limit", 0)),
                 rpd_limit=int(cfg.get("rpd_limit", 0)),
                 web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
+                auth_bearer=bool(cfg.get("auth_bearer", True)),
             )
         )
 
@@ -226,6 +228,7 @@ class Rotator:
                         rpm_limit=int(cfg.get("rpm_limit", 0)),
                         rpd_limit=int(cfg.get("rpd_limit", 0)),
                         web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
+                        auth_bearer=bool(cfg.get("auth_bearer", True)),
                     )
                 )
             )
@@ -257,6 +260,7 @@ class Rotator:
             pcfg.base_url,
             pcfg.models,
             web_search_passthrough=pcfg.web_search_passthrough,
+            auth_bearer=pcfg.auth_bearer,
         )
         return ProviderState(cfg=pcfg, ring=ring, provider=provider)
 
