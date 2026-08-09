@@ -149,7 +149,9 @@ class Provider:
 
     def __init__(self, models: list[str]):
         self.models = models
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=15.0), follow_redirects=True
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -181,7 +183,11 @@ class Provider:
         if not proxy:
             return None
         url = proxy if "://" in proxy else f"http://{proxy}"
-        return httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0), proxy=url)
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=15.0),
+            proxy=url,
+            follow_redirects=True,
+        )
 
     # -- shared response parsing / error mapping -----------------------------
     @staticmethod
@@ -1256,7 +1262,9 @@ async def _fetch_live_gemini(
             models: list[LiveModel] = []
             page_token: Optional[str] = None
             fetched_at = __import__("time").time()
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=True
+            ) as client:
                 for _ in range(max_pages):
                     url = f"{models_url}?pageSize=200"
                     if page_token:
@@ -1305,7 +1313,9 @@ async def _fetch_live_openai(
             after: Optional[str] = None
             fetched_at = __import__("time").time()
             headers = {"Authorization": f"Bearer {key}"}
-            async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0)) as client:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout, connect=10.0), follow_redirects=True
+            ) as client:
                 for _ in range(max_pages):
                     url = models_url
                     if after:
