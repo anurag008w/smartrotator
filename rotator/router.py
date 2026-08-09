@@ -451,6 +451,7 @@ class Rotator:
         response_format: Optional[dict] = None,
         seed: Optional[int] = None,
         logit_bias: Optional[dict] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> ChatResult:
         """
         Main entry: send messages, rotating keys+models+providers on failure.
@@ -461,6 +462,8 @@ class Rotator:
         - `tools` / `tool_choice` = function calling (OpenAI format) pass-through
         - baaki params (top_p, stop, response_format, seed, ...) = models ki
           real power — pass-through hota hai, rotate hone ke bawajood.
+        - `reasoning_effort` = "low" | "medium" | "high" — thinking budget
+          control (Gemini me thinkingConfig.thinkingBudget me map hota hai).
         """
         attempts = max_fallback_attempts or int(self.settings.get("max_fallback_attempts", 16))
         last_error: Optional[Exception] = None
@@ -569,6 +572,7 @@ class Rotator:
                     seed=seed,
                     logit_bias=logit_bias,
                     base_url=request_base_url,
+                    reasoning_effort=reasoning_effort,
                 )
                 ring.report_success(state, resolved_model)
                 ring.record_used(state)

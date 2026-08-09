@@ -299,6 +299,7 @@ class OpenAICompatibleProvider(Provider):
         seed: Optional[int] = None,
         logit_bias: Optional[dict] = None,
         base_url: Optional[str] = None,   # per-key base_url override (optional)
+        reasoning_effort: Optional[str] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError(f"{self.name}: no api key provided", retryable=False)
@@ -336,6 +337,10 @@ class OpenAICompatibleProvider(Provider):
             payload["seed"] = seed
         if logit_bias:
             payload["logit_bias"] = logit_bias
+        if reasoning_effort:
+            # reasoning effort OpenAI-compatible upstreams pe pass-through —
+            # kuch gateways (zen etc.) isse support karte hain
+            payload["reasoning_effort"] = reasoning_effort
         if tools:
             # web_search tools most OpenAI-compat platforms pe support nahi hote
             # (OpenRouter/zen unknown type pe 400 dete hain) — default filter karo.
@@ -494,6 +499,7 @@ class GeminiProvider(Provider):
         seed: Optional[int] = None,
         logit_bias: Optional[dict] = None,
         base_url: Optional[str] = None,   # per-key base_url override (optional)
+        reasoning_effort: Optional[str] = None,
     ) -> ChatResult:
         if not api_key:
             raise AuthError("gemini: no api key provided", retryable=False)
@@ -509,9 +515,23 @@ class GeminiProvider(Provider):
         # Gemini thinking/reasoning output (`thought: true` parts) default me
         # response me NAHI aata — `includeThoughts: true` karna padta hai.
         # Isi se opencode/client ko `reasoning_content` (thinking) milta hai.
-        # Kuch models is param ko 400 de sakte hain — HTTPStatusError handler
-        # me bina thinkingConfig ke retry hota hai (neeche dekho).
-        body["generationConfig"]["thinkingConfig"] = {"includeThoughts": True}
+        # User/client `reasoning_effort` (low|medium|high) se thinking budget
+        # bhi control kar sakta hai — OpenAI-compatible standard field:
+        #   low    → chhota budget (fast, halka thinking)
+        #   medium → default-ish budget
+        #   high   → bada budget (deep thinking)
+        #   None   → includeThoughts true, budget model apne default pe
+        # Kuch models thinkingConfig ko 400 de sakte hain — HTTPStatusError
+        # handler me bina thinkingConfig ke retry hota hai (neeche dekho).
+        thinking_cfg: dict = {"includeThoughts": True}
+        effort = (reasoning_effort or "").strip().lower()
+        if effort == "low":
+            thinking_cfg["thinkingBudget"] = 256
+        elif effort == "medium":
+            thinking_cfg["thinkingBudget"] = 2048
+        elif effort == "high":
+            thinking_cfg["thinkingBudget"] = 8192
+        body["generationConfig"]["thinkingConfig"] = thinking_cfg
         # Gemini mapping — models ki real power (jo params Gemini support karta hai)
         if top_p is not None:
             body["generationConfig"]["topP"] = top_p

@@ -342,6 +342,9 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[dict] = None  # {"type": "json_object"} JSON mode
     seed: Optional[int] = None
     logit_bias: Optional[dict] = None
+    # Reasoning effort — user/client control: "low" | "medium" | "high"
+    # (OpenAI-compatible standard field; Gemini ke liye thinkingBudget me map)
+    reasoning_effort: Optional[str] = None
 
 
 class EmbeddingsRequest(BaseModel):
@@ -1759,6 +1762,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             response_format=req.response_format,
             seed=req.seed,
             logit_bias=req.logit_bias,
+            reasoning_effort=req.reasoning_effort,
         )
     except RateLimitError as exc:
         # provider rate-limit — user ko raw message NAHI dikhate
