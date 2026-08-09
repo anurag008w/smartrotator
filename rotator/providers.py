@@ -617,12 +617,17 @@ class GeminiProvider(Provider):
             # Reasoning model (gemini-3.x-flash etc.) ne saara token budget
             # thinking me kha liya → reply empty ya truncated aata hai
             # (thoughtsTokenCount bada, text "" ya MAX_TOKENS pe ruk gaya).
-            # thinkingBudget: 0 se thinking band karke seedha answer milta hai —
-            # bas kuch models (3.6-flash) is config ko 400 dete hain, isliye
-            # sirf is case me try karo aur 400 aaye to original reply chhodo.
+            # User ko reasoning_content (thinking) bhi chahiye, isliye thinking
+            # band karne ke bajaye budget KAM karke retry karo — answer aayega
+            # AUR reasoning bhi preserve rahegi. Kuch models (3.6-flash)
+            # thinkingConfig hi 400 dete hain → tab bina thinkingConfig retry.
             if (not text.strip() and not tool_calls) or (thoughts > 0 and finish_reason == "MAX_TOKENS"):
+                original_reasoning = reasoning
                 try:
-                    body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+                    tc = body["generationConfig"].setdefault("thinkingConfig", {})
+                    current_budget = tc.get("thinkingBudget") or 4096
+                    # thinking kam karke answer ke liye jagah banao
+                    tc["thinkingBudget"] = min(current_budget, 2048)
                     resp2 = await http.post(
                         url, headers=headers, params=params, json=body
                     )
@@ -631,13 +636,29 @@ class GeminiProvider(Provider):
                     self._check_error_body(data, self.name)
                     text = self._extract_text(data)
                     tool_calls = self._extract_tool_calls(data)
-                    reasoning = self._extract_thoughts(data)
+                    reasoning = self._extract_thoughts(data) or original_reasoning
                     usage = data.get("usageMetadata", {})
                 except httpx.HTTPStatusError as exc2:
-                    # model thinkingConfig support nahi karta — original reply
-                    # hi rakh lo; router empty text ko failure treat karke agli
-                    # key/model try karega
-                    pass
+                    if exc2.response.status_code == 400:
+                        # model thinkingConfig support nahi karta — bina
+                        # thinkingConfig ke retry (reasoning miss hoga, content
+                        # milega); original reasoning bhi saath rakho
+                        body["generationConfig"].pop("thinkingConfig", None)
+                        try:
+                            resp3 = await http.post(
+                                url, headers=headers, params=params, json=body
+                            )
+                            resp3.raise_for_status()
+                            data = self._parse_json_response(resp3, self.name)
+                            self._check_error_body(data, self.name)
+                            text = self._extract_text(data)
+                            tool_calls = self._extract_tool_calls(data)
+                            reasoning = self._extract_thoughts(data) or original_reasoning
+                            usage = data.get("usageMetadata", {})
+                        except httpx.HTTPStatusError as exc3:
+                            raise self._map_error(exc3, self.name) from exc3
+                    else:
+                        raise self._map_error(exc2, self.name) from exc2
             return ChatResult(
                 text=text,
                 provider=self.name,

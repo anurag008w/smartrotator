@@ -12,6 +12,8 @@ bhi add ho sakta hai (dashboard me free-text option hai).
 
 MODEL_CATALOG: dict[str, list[str]] = {
     "gemini": [
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.0-flash",

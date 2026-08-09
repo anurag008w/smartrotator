@@ -30,7 +30,8 @@ providers:
     # ya direct googleapi alt-endpoint:
     #   base_url: https://generativelanguage.googleapis.com/v1beta
     models:
-      - gemini-2.5-flash        # fast + vision + image input
+      - gemini-3.5-flash        # fast + vision + image input + thinking (reasoning_content)
+      - gemini-2.5-flash        # fallback
       # - gemini-2.5-pro        # strong, but sirf 50 RPD free me
     api_keys:
       - "PASTE_GEMINI_KEY_1"
@@ -143,5 +144,5 @@ auth:
 server:
   host: 0.0.0.0
   port: 8000
-  default_model: gemini-2.5-flash   # jab client model specify na kare
+  default_model: gemini-3.5-flash   # jab client model specify na kare
   allow_model_routing: true         # client ko koi bhi configured model allow karo
