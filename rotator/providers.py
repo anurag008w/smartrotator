@@ -386,6 +386,14 @@ class OpenAICompatibleProvider(Provider):
             # ise wapas pass kar sake (tool-loop round-trip ke liye MUST).
             reasoning = (message.get("reasoning_content") or "").strip()
             tool_calls = message.get("tool_calls") or []
+            # kuch reasoning models (zen/big-pickle, DeepSeek R1 via some
+            # gateways) poora answer sirf `reasoning_content` me dete hain aur
+            # `content` empty chhod dete hain. Router empty text ko failure
+            # treat karta hai — isliye content blank ho toh reasoning ko
+            # fallback text banao (reasoning_content field bhi preserve rakho
+            # taaki round-trip na toote).
+            if not text and reasoning and not tool_calls:
+                text = reasoning
             usage = data.get("usage", {})
             return ChatResult(
                 text=text,

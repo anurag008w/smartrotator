@@ -599,6 +599,10 @@ class Rotator:
                 ring.report_failure(state, resolved_model)
                 if proxy and self.proxy_pool:
                     self.proxy_pool.report_failure(proxy)
+                # RateLimitError pe bhi diagnostics update karo — warna
+                # provider "0 failures" dikhata hai jabki key cooldown me hai
+                st.failures += 1
+                st.last_error = str(exc)
                 last_error = exc
             except ProviderError as exc:
                 ring.report_failure(state, resolved_model)
