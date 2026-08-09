@@ -1671,20 +1671,23 @@ async def _stream_chat_completion(result, req: "ChatCompletionRequest"):
     # 1. role chunk — clients isi se assistant message shuru karte hain
     yield frame({"role": "assistant", "content": ""})
 
-    # 2. tool_calls (agar hain) — ek hi chunk me poora bhej dete hain
+    # 2. reasoning (agar hai) — DeepSeek/OpenAI standard: thinking PEHLE aati
+    #    hai, phir answer. OpenCode/siyuan jaise clients isi order se
+    #    "thinking" block + answer render karte hain. Content ke baad bheja
+    #    toh reasoning tab sahi se nahi dikhta.
+    if result.reasoning_content:
+        yield frame({"reasoning_content": result.reasoning_content})
+
+    # 3. tool_calls (agar hain) — ek hi chunk me poora bhej dete hain
     #    (true incremental function-call streaming abhi support nahi hai,
     #    par clients ko poora tool_calls array milte hi kaam ho jata hai)
     if result.tool_calls:
         yield frame({"tool_calls": result.tool_calls})
 
-    # 3. content — chhote-chhote pieces me (typing effect)
+    # 4. content — chhote-chhote pieces me (typing effect)
     for piece in _sse_text_chunks(result.text):
         yield frame({"content": piece})
         await asyncio.sleep(0.01)
-
-    # 4. reasoning (agar hai)
-    if result.reasoning_content:
-        yield frame({"reasoning_content": result.reasoning_content})
 
     # 5. finish chunk
     yield frame({}, finish_reason="tool_calls" if result.tool_calls else "stop")
