@@ -526,11 +526,14 @@ class GeminiProvider(Provider):
         thinking_cfg: dict = {"includeThoughts": True}
         effort = (reasoning_effort or "").strip().lower()
         if effort == "low":
-            thinking_cfg["thinkingBudget"] = 256
-        elif effort == "medium":
+            # chat replies + tool decisions (default toolThinking)
             thinking_cfg["thinkingBudget"] = 2048
+        elif effort == "medium":
+            # background memory summaries (default)
+            thinking_cfg["thinkingBudget"] = 4096
         elif effort == "high":
-            thinking_cfg["thinkingBudget"] = 8192
+            # deep thinking — jab user explicitly high select kare
+            thinking_cfg["thinkingBudget"] = 16384
         body["generationConfig"]["thinkingConfig"] = thinking_cfg
         # Gemini mapping — models ki real power (jo params Gemini support karta hai)
         if top_p is not None:
