@@ -214,6 +214,46 @@ class Provider:
         return data
 
     @staticmethod
+    def _unwrap_proxy_response(data: dict, context: str) -> dict:
+        """Google Apps Script proxy (old version) wrapped response ko unwrap karo.
+
+        GAS web app apna HTTP status code set nahi kar sakta — isliye purana
+        version har response `{"__proxy_status": <real>, "__proxy_provider": ...,
+        "__proxy_body": "<upstream raw body>"}` me wrap karta hai. SmartRotator
+        ko PLAIN OpenAI JSON chahiye, isliye:
+          - 2xx  → `__proxy_body` ko JSON parse karke return
+          - non-2xx → ProviderError (real status ke saath)
+        Naya GAS version (2xx pe plain JSON) is helper se bina kisi effect ke
+        guzarta hai — isliye dono versions compatible hain.
+        """
+        if "__proxy_status" not in data:
+            return data
+        real_code = data.get("__proxy_status")
+        body = data.get("__proxy_body") or ""
+        try:
+            real_code = int(real_code)
+        except (TypeError, ValueError):
+            real_code = 200
+        if real_code >= 400:
+            raise ProviderError(
+                f"{context}: proxy upstream error (HTTP {real_code}): {str(body)[:300]}",
+                status_code=502,
+            )
+        try:
+            inner = json.loads(body) if isinstance(body, str) else body
+        except ValueError as exc:
+            raise ProviderError(
+                f"{context}: proxy wrapped invalid JSON: {str(body)[:200]}",
+                status_code=502,
+            ) from exc
+        if not isinstance(inner, dict):
+            raise ProviderError(
+                f"{context}: proxy wrapped non-object body: {str(body)[:200]}",
+                status_code=502,
+            )
+        return inner
+
+    @staticmethod
     def _extract_error_message(data: dict, context: str) -> str:
         """OpenAI-style error body se human-readable message nikalo."""
         err = data.get("error")
@@ -369,6 +409,9 @@ class OpenAICompatibleProvider(Provider):
             resp = await http.post(endpoint, headers=headers, json=payload)
             resp.raise_for_status()
             data = self._parse_json_response(resp, self.name)
+            # GAS (old) wrapped responses ko unwrap karo — naya plain JSON
+            # version isse bina effect ke guzarta hai
+            data = self._unwrap_proxy_response(data, self.name)
             # kuch gateways 200 status pe hi error body bhej dete hain
             self._check_error_body(data, self.name)
 
