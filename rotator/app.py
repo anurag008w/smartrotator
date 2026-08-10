@@ -714,6 +714,21 @@ async def sync_delete_state(request: Request, scope: str = "state"):
 # --------------------------------------------------------------------------
 # Admin endpoints
 # --------------------------------------------------------------------------
+@app.post("/admin/sync/now")
+async def admin_sync_now(request: Request):
+    """Force GitHub data push NOW — app ke 'Sync now' button se call hota hai.
+
+    Normal GitHub sync har GITHUB_SYNC_INTERVAL (180s) pe chalta hai; ye
+    endpoint loop ka wait nahi karta — data/ ko turant private repo me push
+    karta hai. Sirf super admin (env ADMIN_USERS), rate-limited (12/hour)
+    taaki koi endpoint ko abuse karke baar-baar push na kar sake.
+    """
+    user = await _require_admin(request)
+    await _enforce_rate_limit(request, "admin_sync_now", 12, 3600)
+    pushed = await asyncio.to_thread(github_sync.push_data)
+    return {"username": user.username, "pushed": pushed, **github_sync.sync_status()}
+
+
 @app.get("/admin/users")
 async def admin_users(request: Request):
     settings = _auth_settings()
