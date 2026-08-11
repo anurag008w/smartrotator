@@ -53,11 +53,11 @@ class KeyState:
     def mark_failure(self, cooldown_seconds: float, ban_after: int) -> None:
         self.consecutive_failures += 1
         self.total_fail += 1
-        if self.consecutive_failures >= ban_after:
-            # temporary ban — longer cooldown
-            self.cooldown_until = time.time() + max(cooldown_seconds * 5, 300)
-        else:
-            self.cooldown_until = time.time() + cooldown_seconds
+        # 429/500 ke baad key ko cooldown_seconds ki chill. Pehle repeated
+        # fails pe max(cooldown*5, 300)s ka lamba ban milta tha — ab ban bhi
+        # same duration ka hai taaki keys jaldi wapas try ho saken (user ka
+        # 30s wala behaviour). Consecutive failures count track hota rahta hai.
+        self.cooldown_until = time.time() + cooldown_seconds
 
     def record_request(self, now: float | None = None) -> None:
         now = now if now is not None else time.time()
@@ -253,8 +253,8 @@ class KeyRing(RoundRobinPool[KeyState]):
             pair = (state.key, model)
             self._pair_failures[pair] = self._pair_failures.get(pair, 0) + 1
             if self._pair_failures[pair] >= self._ban_after:
-                # whole key gets a long cooldown
-                state.cooldown_until = time.time() + max(self._cooldown_seconds * 5, 300)
+                # whole key gets the same cooldown (fast retry, no 5x ban)
+                state.cooldown_until = time.time() + self._cooldown_seconds
                 for p in [p for p in self._pair_cooldown if p[0] == state.key]:
                     del self._pair_cooldown[p]
             else:

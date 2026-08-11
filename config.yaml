@@ -13,7 +13,7 @@
 rotation:
   strategy: round_robin        # round_robin | random | health
   provider_strategy: sequential # sequential (ek provider drain karo, phir agli) | round_robin
-  cooldown_seconds: 60         # 429/500 ke baad kitni der key ko chill do
+  cooldown_seconds: 30         # 429/500 ke baad kitni der key ko chill do
   max_fallback_attempts: 16    # ek request me kitni baar doosra key/model/provider try kare
   fail_after_attempts: 3       # kitne consecutive fails pe key ko temporary banish karo
 
