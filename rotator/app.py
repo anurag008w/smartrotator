@@ -37,11 +37,12 @@ from pathlib import Path
 from typing import Optional, Union
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import github_sync
+from . import live as live_proxy
 from . import store as database
 from . import usersync
 from .catalog import MODEL_CATALOG
@@ -464,8 +465,19 @@ async def list_models(request: Request):
     # Dashboard "Exposed Models" tab se admin select karta hai ki /v1/models
     # me kaun se models dikhen (provider_models → apply_managed se cfg.models
     # override ho jata hai). External apps ke liye exactly wahi dikhega.
+    #
+    # `live: true` flag = Gemini LIVE/voice model (WebSocket /v1/live se use
+    # hota hai, `/v1/chat/completions` se NAHI). Clients isse apne UI me
+    # "Live/Voice" badge dikha sakte hain aur sahi endpoint pe route kar
+    # sakte hain.
     data = [
-        {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
+        {
+            "id": m["id"],
+            "object": "model",
+            "owned_by": m["provider"],
+            "type": m["type"],
+            "live": live_proxy.is_live_model(m["id"]),
+        }
         for m in rotator.models()
     ]
     return {"object": "list", "data": data, "default_model": rotator.default_model}
@@ -476,10 +488,235 @@ async def list_models_raw(request: Request):
     """Raw (bina live merge) models — dashboard picker ke liye lighter."""
     rotator: Rotator = request.app.state.rotator
     data = [
-        {"id": m["id"], "object": "model", "owned_by": m["provider"], "type": m["type"]}
+        {
+            "id": m["id"],
+            "object": "model",
+            "owned_by": m["provider"],
+            "type": m["type"],
+            "live": live_proxy.is_live_model(m["id"]),
+        }
         for m in rotator.models()
     ]
     return {"object": "list", "data": data, "default_model": rotator.default_model}
+
+
+@app.websocket("/v1/live")
+async def live_endpoint(websocket: WebSocket):
+    """Gemini Live API (realtime voice/audio) WebSocket gateway.
+
+    /v1/live — SmartRotator ka custom alias. Google-exact path
+    (/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent)
+    ke saath saath isko bhi use kar sakte ho. Dono same served karte hain.
+    """
+    await _handle_live_ws(websocket)
+
+
+@app.websocket(
+    "/ws/google.ai.generativelanguage.{api_version}.GenerativeService.BidiGenerateContent"
+)
+async def live_gemini_ws(websocket: WebSocket, api_version: str):
+    """Google-exact Gemini Live API WebSocket path — @google/genai SDK optional.
+
+    `@google/genai` SDK (GoogleGenAI) jab kisi custom baseUrl pe point karta hai
+    toh exactly is path pe connect karta hai:
+      wss://<baseUrl>/ws/google.ai.generativelanguage.{v1beta}.GenerativeService.BidiGenerateContent?key=<apiKey>
+
+    Isliye koi bhi app jo GoogleGenAI SDK use karta hai (jaise LevelUp ka Live
+    Voice) bas `httpOptions: { baseUrl: 'https://smartrotator.onrender.com' }`
+    set karke yahan connect karega — bina protocol change ke.
+    Automatic route — same auth + quota + gemini-key relay.
+    """
+    # is route pe Google SDK bina '/ws/...' path ke bhi connect kar sakta hai
+    # jab custom base URL diya ho (url = websocketBaseUrl), lekin jab standard
+    # auth ho toh yeh path exact ya atta hai. Dono handle karte hain.
+    await _handle_live_ws(websocket)
+
+
+async def _handle_live_ws(websocket: WebSocket):
+    """Shared Gemini Live relay handler — auth + quota + gemini key + relay.
+
+    Client connect karta hai:
+      wss://host/v1/live?key=USER_API_KEY
+      wss://host/ws/...BidiGenerateContent?key=USER_API_KEY
+      (ya 'Authorization: Bearer <token>' header se)
+
+    Client ka pahla message BidiGenerateContent setup hona chahiye:
+      {"setup": {"model": "models/gemini-3.1-flash-live-preview",
+                 "generation_config": {"response_modalities": ["AUDIO"]}, ...}}
+    Fir client realtimeInput / clientContent / toolResponse etc. bhejta hai —
+    SmartRotator inhe apni (rotated) gemini key ke saath Google Live API tak
+    relay karta hai, aur Google ke server frames wapas client ko.
+    """
+    settings = _auth_settings()
+    user = None
+
+    # WebSocket post-handshake HTTP error nahi de sakta — pehle accept karte
+    # hain, phir auth fail pe graceful JSON error message + close.
+    try:
+        await websocket.accept()
+    except Exception:  # noqa: BLE001
+        return
+
+    try:
+        # 1) auth + quota
+        if settings["enabled"]:
+            user = await _ws_authenticate(websocket, settings)
+            if user is None:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "UNAUTHORIZED",
+                                "message": (
+                                    "Invalid/missing token. ?key=USER_API_KEY query "
+                                    "param ya 'Authorization: Bearer <token>' bhejo."
+                                ),
+                            }
+                        }
+                    )
+                )
+                await websocket.close(code=4401)
+                return
+            if not await _reserve_quota(user):
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "QUOTA_EXCEEDED",
+                                "message": "Aapka daily quota khatam ho gaya.",
+                            }
+                        }
+                    )
+                )
+                await websocket.close(code=4403)
+                return
+
+        # 2) gemini key pick (rotation)
+        rotator: Rotator = websocket.app.state.rotator
+        key, key_label = live_proxy.pick_gemini_live_key(rotator)
+        if not key:
+            message = {
+                "error": {
+                    "code": "NO_GEMINI_KEYS",
+                    "message": (
+                        "Koi gemini API key configure nahi hai. Dashboard se "
+                        "GEMINI_KEYS env set karo."
+                    ),
+                }
+            }
+            await websocket.send_text(json.dumps(message))
+            if user:
+                await _refund_quota(user)
+            await websocket.close(code=4403)
+            return
+
+        # 3) relay session — client ke messages ko iterate karke Google ko
+        #    bhejna, aur Google ke responses client ko.
+        async def client_send(data):
+            try:
+                if isinstance(data, (bytes, bytearray)):
+                    await websocket.send_bytes(bytes(data))
+                else:
+                    await websocket.send_text(str(data))
+            except WebSocketDisconnect:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+
+        client_recv = _ws_client_stream(websocket)
+
+        try:
+            stats = await live_proxy.relay_live_session(
+                client_send,
+                client_recv,
+                gemini_key=key,
+            )
+        except WebSocketDisconnect:
+            logger.info("live: client disconnected (user=%s)", user.username if user else "?")
+            stats = {"ok": True, "reason": "client_disconnected"}
+        except Exception as exc:  # noqa: BLE001 — upstream/net/relay errors
+            logger.warning("live: session error (user=%s): %r", user.username if user else "?", exc)
+            try:
+                await websocket.send_text(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "SESSION_ERROR",
+                                "message": f"Live session me dikkat aayi: {exc}",
+                            }
+                        }
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            stats = {"ok": False, "reason": "session_error", "error": str(exc)}
+
+        # 4) quota handling — graceful close ho ya error, setup hi nahi bana
+        #    toh reserved quota refund karte hain (session upstream tak gaya
+        #    hi nahi). Args: actual live session ho chuka hi nahi.
+        if user and not stats.get("ok"):
+            await _refund_quota(user)
+
+    except WebSocketDisconnect:
+        # client handshake ke baad gayab — upar relay bhi handle karega
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("live: unexpected error: %r", exc)
+        try:
+            await websocket.close(code=1011)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _ws_client_stream(websocket: WebSocket):
+    """Client WebSocket se strings/bytes yield karta iterator.
+
+    FastAPI websocket.receive_text()/receive_bytes() dono handle karte hain.
+    Streaming top-level me directly hoga — yeh async generator hai.
+    """
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(
+                    code=message.get("code", 1000), reason=message.get("reason", "")
+                )
+            mtype = message.get("type")
+            if mtype == "websocket.receive":
+                text = message.get("text")
+                if text is not None:
+                    yield text
+                    continue
+                bytes_ = message.get("bytes")
+                if bytes_ is not None:
+                    yield bytes_
+                    continue
+            # koi aur type (ping/pong/close) — loop jari rakho
+    except GeneratorExit:
+        return
+
+
+async def _ws_authenticate(websocket: WebSocket, settings: dict):
+    """WebSocket ke liye auth — ?key= query param ya Authorization header
+    dono support karta hai (is_user_api_key + JWT same as _authenticate)."""
+    token = websocket.query_params.get("key") or websocket.query_params.get("token")
+    if not token:
+        auth = websocket.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+
+    if not token:
+        return None
+    if is_user_api_key(token):
+        return await database.get_user_by_api_key(token)
+    payload = decode_jwt(token, settings["jwt_secret"])
+    if payload:
+        try:
+            return await database.get_user_by_id(int(payload["sub"]))
+        except (KeyError, ValueError, TypeError):
+            logger.warning("live: JWT payload me invalid 'sub' (%r)", payload.get("sub"))
+            return None
+    return None
 
 
 @app.get("/status")
