@@ -203,8 +203,17 @@ async def relay_live_session(
                         await upstream.send(bytes(msg))
                     else:
                         await upstream.send(str(msg))
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except asyncio.CancelledError:  # noqa: BLE001
                 pass
+            except Exception as exc:  # noqa: BLE001
+                # Audio/setup aage-piche relay ke duran upstream fail
+                # (Google ne conn close kiya / send fail). Hot diagnostic —
+                # Render pe WARNING visible, silent swallow na ho.
+                logger.warning(
+                    "live: client->upstream relay error: %r  (len frame ho sakta "
+                    "hai audio; closing session)",
+                    exc,
+                )
             finally:
                 client_ok.set()
 
@@ -215,8 +224,12 @@ async def relay_live_session(
                         await client_send(bytes(msg))
                     else:
                         await client_send(str(msg))
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except asyncio.CancelledError:  # noqa: BLE001
                 pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "live: upstream->client relay error: %r", exc
+                )
             finally:
                 upstream_ok.set()
 
@@ -231,10 +244,12 @@ async def relay_live_session(
             return_when=asyncio.FIRST_COMPLETED,
         )
         # jise task finish hua usme exception ho sakta hai — catch karo
+        session_error = None
         for task in done:
             exc = task.exception()
             if exc:
-                logger.debug("live: relay task error: %r", exc)
+                logger.warning("live: relay task error: %r", exc)
+                session_error = repr(exc)
 
         # cleanup: doosre relay task ko cancel karo
         for task in (relay_client, relay_upstream):
@@ -242,7 +257,10 @@ async def relay_live_session(
                 task.cancel()
         await asyncio.gather(relay_client, relay_upstream, return_exceptions=True)
 
-        return {"ok": True, "setup_model": setup_model}
+        result = {"ok": True, "setup_model": setup_model}
+        if session_error:
+            result["error"] = session_error
+        return result
 
     finally:
         try:
