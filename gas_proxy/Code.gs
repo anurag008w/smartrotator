@@ -25,8 +25,15 @@
  *      - Execute as: Me
  *      - Who has access: Anyone
  *   4. URL milega: https://script.google.com/macros/s/{SCRIPT_ID}/exec
- *   5. SmartRotator me base_url daalo:
+ * 5. SmartRotator me base_url daalo:
  *      https://script.google.com/macros/s/{SCRIPT_ID}/exec?target=zen/v1
+ *
+ * PERFORMANCE OPTIMIZATIONS (2026-09-07):
+ *   • getOpencodeVersion() ab CacheService (in-memory, 6h) se — PropertyService
+ *     remote read har request pe nahi hota (har remote I/O ~100-300ms latency).
+ *   • fetchWithRetry backoff ab chhota (250ms base vs 1s pehle) — fast
+ *     fail-fast retry; non-retryable 4xx (401/400/403) pe 0 sleep, turant wapas.
+ *   • Inhe baad me aur tune karne ke liye constants hoist kiye hain.
  *
  * Routes (query param `target`):
  *   zen        → target=zen/v1          → https://opencode.ai/zen/v1
@@ -93,12 +100,34 @@ var USER_AGENTS = [
 // OpenCode version — GAS script properties se override kar sakte ho, warna
 // default (kal ki latest release). Auto-update: script property set karo:
 //   Script Properties → OPENCODE_VERSION = "1.18.29"
+//
+// OPTIMIZATION: PropertyService ek remote (slow) I/O hai — har request pe ise
+// read karna latency deta hai. Isliye CacheService (in-memory, fast) se 6 ghante
+// cache karte hain. Script property set/change karne pe cache expire hone tak
+// purana version hi rahega, par User-Agent version ka impact minimal hai.
+var OPENCODE_VERSION_CACHE_KEY = "opencode_version";
+var OPENCODE_VERSION_CACHE_SEC = 6 * 60 * 60; // 6 hrs
+
 function getOpencodeVersion() {
   try {
-    var v = PropertiesService.getScriptProperties().getProperty("OPENCODE_VERSION");
-    if (v && v.trim()) return v.trim();
-  } catch (e) { /* ignore */ }
-  return "1.18.29";
+    var cache = CacheService.getScriptCache();
+    var cached = cache.get(OPENCODE_VERSION_CACHE_KEY);
+    if (cached) return cached;
+
+    var v = "";
+    try {
+      v = PropertiesService.getScriptProperties().getProperty("OPENCODE_VERSION");
+    } catch (e) { /* ignore */ }
+    if (!v || !v.trim()) v = "1.18.29";
+    v = v.trim();
+
+    try {
+      cache.put(OPENCODE_VERSION_CACHE_KEY, v, OPENCODE_VERSION_CACHE_SEC);
+    } catch (e) { /* ignore */ }
+    return v;
+  } catch (e) {
+    return "1.18.29";
+  }
 }
 
 // OpenCode Zen/Go official CLI headers — bina inke backend `MissingSessionID`
@@ -126,21 +155,35 @@ function pick(arr) {
 // 2.5) fetch with retry — Google ke shared IP pool pe 429/5xx transient hota
 //      hai (doosre users ka traffic bhi same pool se jaata hai). Exponential
 //      backoff se short-lived blocks recover ho jaate hain.
+//
+// OPTIMIZATION:
+//   • Cold start / transient errors pe retry HOT path hai — backoff ko chhota
+//     rkha (250ms base) taaki fast fail-fast retry ho. LLM upstream response
+//     ke liye koi delay add nahi hota — sirf fail pe hi sleep hota hai.
+//   • Pehle attempt (attempt 0) pe 0 delay — koi unnecessary wait nahi.
+//   • Non-retryable 4xx (401/400/403) ko speed mein skip — ek hi attempt.
 // ---------------------------------------------------------------------------
-function fetchWithRetry(url, options, maxRetries) {
+function fetchWithRetry(url, options, maxRetries, noRetryCodes) {
   maxRetries = maxRetries || 3;
+  noRetryCodes = noRetryCodes || [400, 401, 403, 404, 405, 409, 422];
   var resp;
   for (var attempt = 0; attempt <= maxRetries; attempt++) {
     resp = UrlFetchApp.fetch(url, options);
     var code = resp.getResponseCode();
+    // Non-retryable client error ho toh turant wapas — extra sleep bilkul mat
+    if (noRetryCodes.indexOf(code) !== -1) {
+      return resp;
+    }
     if (code !== 429 && code < 500) {
       return resp;
     }
     if (attempt === maxRetries) {
       return resp; // retries khatam — asli response wapas (client ko dikhega)
     }
-    // backoff: 1s, 2s, 4s (+ thoda random jitter taaki ek saath retry na karein)
-    Utilities.sleep((Math.pow(2, attempt) * 1000) + Math.floor(Math.random() * 800));
+    // backoff: 250ms, 500ms, 1s + thoda jitter. Chhota & fast — LLM proxy
+    // ke liye latency hi priority hai, sirf transient block recovery ke
+    // liye wait karte hain.
+    Utilities.sleep((Math.pow(2, attempt) * 250) + Math.floor(Math.random() * 200));
   }
   return resp;
 }
