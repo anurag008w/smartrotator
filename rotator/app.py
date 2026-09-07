@@ -966,6 +966,40 @@ async def admin_sync_now(request: Request):
     return {"username": user.username, "pushed": pushed, **github_sync.sync_status()}
 
 
+@app.post("/admin/providers/clear-stored-keys")
+async def admin_clear_stored_provider_keys(request: Request):
+    """Saare STORED custom-provider keys wipe karo (data/providers.json).
+
+    Render/env se provider keys hatane ke baad bhi purani encrypted keys
+    custom providers ke through active rehti hain — ye endpoint unhe puri
+    tarah clear karta hai (disk + runtime). Sirf super admin (env ADMIN_USERS),
+    rate-limited. Custom providers ki config (base_url/models) bhi clear hoti
+    hai — unhe dashboard se dobara add karna hoga. Sirf env-keyed providers
+    (config.yaml se) kaam karte rahenge.
+
+    Body (optional): {"confirm": true} — accidental wipe se bachne ke liye
+    explicit confirm maangte hain.
+    """
+    user = await _require_admin(request)
+    await _enforce_rate_limit(request, "admin_clear_stored_keys", 10, 3600)
+    body = await request.json()
+    if not body.get("confirm"):
+        raise HTTPException(
+            status_code=400,
+            detail='Confirm karo: {"confirm": true} bhejo. Ye saare stored custom provider keys wipe kar dega.',
+        )
+    before = await database.list_custom_providers()
+    await database.save_custom_providers([])          # disk + in-memory clear
+    rotator: Rotator = request.app.state.rotator
+    rotator.apply_custom_providers([])                 # runtime providers reload
+    return {
+        "username": user.username,
+        "cleared": len(before),
+        "providers": [p.get("name") for p in before],
+        "message": "Stored custom provider keys clear ho gaye. Ab sirf env-keyed providers active hain.",
+    }
+
+
 @app.get("/admin/users")
 async def admin_users(request: Request):
     settings = _auth_settings()

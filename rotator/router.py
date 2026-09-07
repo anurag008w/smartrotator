@@ -53,6 +53,9 @@ class ProviderConfig:
     rpd_limit: int = 0
     web_search_passthrough: bool = False
     auth_bearer: bool = True
+    custom_headers: dict[str, str] = field(default_factory=dict)
+    opencode_headers: bool = False
+    opencode_version: Optional[str] = None
 
 
 class ProviderState:
@@ -172,6 +175,9 @@ class Rotator:
                 rpd_limit=int(cfg.get("rpd_limit", 0)),
                 web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
                 auth_bearer=bool(cfg.get("auth_bearer", True)),
+                custom_headers=dict(cfg.get("custom_headers") or {}),
+                opencode_headers=bool(cfg.get("opencode_headers", False)),
+                opencode_version=(cfg.get("opencode_version") or "").strip() or None,
             )
         )
 
@@ -196,6 +202,12 @@ class Rotator:
     def _merge_custom_states(self) -> None:
         """Custom provider configs se ProviderState banake merge karo."""
         custom_cfgs = getattr(self, "_custom_provider_cfgs", []) or []
+        # config.yaml wale providers (env-resolved keys) — same-name custom
+        # provider inki keys se SYNC hota hai. Isse Render/env se keys hatane
+        # pe purani stored keys active NAHI rehti (root cause fix).
+        config_states = getattr(self, "_config_providers", None) or list(self.providers)
+        config_by_name = {st.cfg.name: st for st in config_states}
+
         custom_states: list[ProviderState] = []
         for cfg in custom_cfgs:
             if not cfg.get("enabled", True):
@@ -208,6 +220,22 @@ class Rotator:
             sel = cfg.get("selected_keys") or []
             if sel:
                 keys = [keys[i] for i in sel if 0 <= i < len(keys)]
+
+            # ---- ENV KEYS SYNC (stale stored keys cleanup) ----
+            # Agar config.yaml mein SAME-NAME provider hota hai, uski keys
+            # env-resolved hain (GEMINI_KEYS/ZEN_KEYS etc). Stored custom keys
+            # ko IGNORE karo aur env keys use karo:
+            #   • env key existing  → custom provider env key se chalta hai
+            #   • env key hata di    → custom provider SKIP (stored purani
+            #     encrypted keys active nahi rehti)
+            # Custom-only providers (config mein nahi) apni stored keys se
+            # chalte hain — woh dashboard se manage hote hain.
+            config_match = config_by_name.get(name)
+            if config_match is not None and config_match.cfg.keys:
+                keys = list(config_match.cfg.keys)
+            elif config_match is not None:
+                continue  # config wala provider ab env-keyless hai → custom skip
+
             # NOTE: `models` yahan mandatory NAHI hai — model selection ab
             # 🎚 Exposed Models tab (live-fetch se) ka kaam hai. Provider
             # bina models ke bhi build hota hai (rotation me routing tabhi
@@ -229,16 +257,15 @@ class Rotator:
                         rpd_limit=int(cfg.get("rpd_limit", 0)),
                         web_search_passthrough=bool(cfg.get("web_search_passthrough", False)),
                         auth_bearer=bool(cfg.get("auth_bearer", True)),
+                        custom_headers=dict(cfg.get("custom_headers") or {}),
+                        opencode_headers=bool(cfg.get("opencode_headers", False)),
+                        opencode_version=(cfg.get("opencode_version") or "").strip() or None,
                     )
                 )
             )
 
         # same name ke custom provider se config.yaml wala override
         custom_names = {st.cfg.name for st in custom_states}
-        config_states = getattr(self, "_config_providers", None)
-        if config_states is None:
-            # purana state (reload hone se pehle) — providers hi base hai
-            config_states = list(self.providers)
         base_states = [st for st in config_states if st.cfg.name not in custom_names]
         self.providers = base_states + custom_states
 
@@ -261,6 +288,9 @@ class Rotator:
             pcfg.models,
             web_search_passthrough=pcfg.web_search_passthrough,
             auth_bearer=pcfg.auth_bearer,
+            custom_headers=pcfg.custom_headers,
+            opencode_headers=pcfg.opencode_headers,
+            opencode_version=pcfg.opencode_version,
         )
         return ProviderState(cfg=pcfg, ring=ring, provider=provider)
 

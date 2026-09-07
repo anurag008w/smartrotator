@@ -89,6 +89,9 @@ providers:
   # ---------- OPENCODE ZEN (opencode.ai — OpenAI-compatible gateway) ----------
   # Key env var se: ZEN_KEYS="sk-..." (Render secret / local env). Config me
   # kabhi real key mat daalo — repo PUBLIC hai!
+  # Direct endpoint use karo (GAS proxy nahi) — streaming SSE ke liye direct
+  # hi kaam karta hai. GAS (script.google.com) buffer karta hai, streaming
+  # wahan nahi chalti.
   # Cloudflare Worker route: /zen/v1 → opencode.ai/zen/v1
   #   base_url: https://<worker>.workers.dev/zen/v1
   - name: zen
@@ -97,6 +100,12 @@ providers:
     # OpenCode Zen `Bearer` prefix REJECT karta hai — sirf raw key accept
     # karta hai (Authorization: sk-...). Isliye auth_bearer: false.
     auth_bearer: false
+    # OpenCode Zen/Go backend (2026-09-06 se) `x-opencode-session` header
+    # require karta hai — warna `MissingSessionID` error/free-tier reject.
+    # opencode_headers: true → official CLI headers auto-inject (version
+    # dynamic — GitHub latest se, 24h cache, env OPENCODE_VERSION se override).
+    opencode_headers: true
+    # opencode_version: "1.18.29"   # optional pin — chhodo toh latest auto
     models:
       - big-pickle
       - glm-5.2

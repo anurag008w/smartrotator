@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Union
 from urllib.parse import quote
@@ -21,6 +23,51 @@ from urllib.parse import quote
 import httpx
 
 GEMINI_V1 = "https://generativelanguage.googleapis.com/v1beta"
+
+# ---- OpenCode version resolution (auto-update hone wala User-Agent) ----
+# OpenCode Zen/Go backend req/User-Agent me asli `opencode/<version>` expect
+# karta hai. Version ko hardcode karne ki jagah latest GitHub release se fetch
+# karte hain (24h cache) taaki app ka version update hote hi header bhi saath
+# update ho. Env `OPENCODE_VERSION` se override kiya ja sakta hai.
+_OPENCODE_VER_CACHE: dict = {"value": None, "ts": 0.0}
+_OPENCODE_VER_TTL = 86400  # 24h (sekund)
+_OPENCODE_VER_FALLBACK = "1.18.29"
+
+
+async def _opencode_version() -> str:
+    """OpenCode ki current version (dynamic, cached 24h) fetch karta hai."""
+    # 1) env/prio override — user explicitly pinned ho toh use karo
+    env_ver = os.environ.get("OPENCODE_VERSION", "").strip()
+    if env_ver and env_ver.lower() not in ("auto", "latest"):
+        return env_ver
+
+    # 2) cache hit
+    now = time.time()
+    if _OPENCODE_VER_CACHE["value"] and (now - _OPENCODE_VER_CACHE["ts"]) < _OPENCODE_VER_TTL:
+        return _OPENCODE_VER_CACHE["value"]
+
+    # 3) GitHub releases/latest se fetch (best-effort — fail pe old value/fallback)
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://api.github.com/repos/anomalyco/opencode/releases/latest",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                tag = (data.get("tag_name") or "").lstrip("v@").strip()
+                if tag:
+                    _OPENCODE_VER_CACHE["value"] = tag
+                    _OPENCODE_VER_CACHE["ts"] = now
+                    return tag
+    except Exception:  # noqa: BLE001 — network hiccup = fallback
+        pass
+
+    # 4) fallback — cached old version ya fixed fallback
+    if _OPENCODE_VER_CACHE["value"]:
+        return _OPENCODE_VER_CACHE["value"]
+    return _OPENCODE_VER_FALLBACK
+
 
 # Zero-width / invisible Unicode characters — ye Python ke str.strip() se
 # nahi hattе (isspace() False), par user ko blank reply dikhata hai.
@@ -311,9 +358,16 @@ class OpenAICompatibleProvider(Provider):
         models: list[str],
         web_search_passthrough: bool = False,
         auth_bearer: bool = True,
+        custom_headers: Optional[dict] = None,
+        opencode_headers: bool = False,
+        opencode_version: Optional[str] = None,
     ):
         super().__init__(models)
         self.name = name
+        # OpenCode version override: config `opencode_version` me daal sakte
+        # hain. Khali/chhoda ho toh dynamically resolve hota hai (latest). `0`
+        # ya `latest` → auto-resolve. Default None = resolved at request time.
+        self.opencode_version = (opencode_version or "").strip() or None
         # top-level base_url optional ho sakta hai — jab har key ka apna
         # gateway ho (per-key base_url), koi provider-wide default zaroori
         # nahi. Yahan hard-fail nahi karte; agar koi key request-time pe bhi
@@ -325,6 +379,14 @@ class OpenAICompatibleProvider(Provider):
         # sirf raw key accept karte hain. config me `auth_bearer: false`
         # laga ke unke liye plain Authorization header bhejo.
         self.auth_bearer = auth_bearer
+        # Static custom headers (har request pe) — config me `custom_headers`
+        # se. GAS/proxy endpoints ya kisi bhi provider ke liye.
+        self.custom_headers = dict(custom_headers) if custom_headers else {}
+        # OpenCode Zen/Go specific: backend ab `x-opencode-session` require
+        # karta hai (2026-09-06 se — warna `MissingSessionID` error → 503/free
+        # tier reject). Official CLI headers inject karke request "OpenCode jaisi"
+        # ban jaati hai. Per-request random session id bharne ke liye chahiye.
+        self.opencode_headers = opencode_headers
 
     async def chat(
         self,
@@ -402,6 +464,31 @@ class OpenAICompatibleProvider(Provider):
             "Authorization": f"Bearer {api_key}" if self.auth_bearer else api_key,
             "Content-Type": "application/json",
         }
+
+        # Static custom headers (config `custom_headers`) — override kar dete hain
+        # lekin Authorization kabhi override nahi hone dete (security).
+        if self.custom_headers:
+            headers.update(self.custom_headers)
+            headers["Authorization"] = f"Bearer {api_key}" if self.auth_bearer else api_key
+
+        # OpenCode Zen/Go: `x-opencode-session` (+ client/project/request ids aur
+        # attribution) inject karo. EK request ki lifetime ke liye stable random
+        # session id — tabhi OpenCode backend isse "official client" maan kar
+        # `MissingSessionID` error ke bajaye response deta hai. Per-request
+        # random id bhi chalti hai (backend cache-affinity ka faayda hi rehtaa
+        # nahi, par error to clear ho jata hai).
+        if self.opencode_headers:
+            import uuid as _uuid
+
+            # User-Agent me version dynamic (latest) — config override prefer
+            version = self.opencode_version or await _opencode_version()
+            headers.setdefault("x-opencode-client", "cli")
+            headers.setdefault("x-opencode-session", str(_uuid.uuid4()))
+            headers.setdefault("x-opencode-project", str(_uuid.uuid4()))
+            headers.setdefault("x-opencode-request", str(_uuid.uuid4()))
+            headers.setdefault("User-Agent", f"opencode/{version}")
+            headers.setdefault("HTTP-Referer", "https://opencode.ai/")
+            headers.setdefault("X-Title", "opencode")
 
         # GAS (Google Apps Script) web app special: client ke HTTP headers
         # upstream tak NAHI pahunchte (GAS ki limitation). Isliye jab endpoint
@@ -1181,6 +1268,9 @@ def build_provider(
     models: list[str],
     web_search_passthrough: bool = False,
     auth_bearer: bool = True,
+    custom_headers: Optional[dict] = None,
+    opencode_headers: bool = False,
+    opencode_version: Optional[str] = None,
 ) -> Provider:
     if ptype == "gemini":
         # custom base_url (Cloudflare Worker gateway / proxy / alt endpoint)
@@ -1197,6 +1287,9 @@ def build_provider(
             models,
             web_search_passthrough=web_search_passthrough,
             auth_bearer=auth_bearer,
+            custom_headers=custom_headers,
+            opencode_headers=opencode_headers,
+            opencode_version=opencode_version,
         )
     raise ValueError(f"provider '{name}': unknown type '{ptype}'")
 
