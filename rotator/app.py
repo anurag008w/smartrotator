@@ -1613,6 +1613,10 @@ async def admin_providers(request: Request):
     # 3) custom providers (dashboard se add) — inki encrypted keys store me hain
     custom = await database.list_custom_providers()
     custom_names = set()
+    # env-sync mirror: runtime state (router._merge_custom_states se) me jo keys
+    # actually active hain wahi dikhao. Render/env se key delete karne pe purani
+    # stored keys UI me NAHI dikhni chahiye (runtime root cause fix ka UI mirror).
+    runtime_by_name = {st.cfg.name: st for st in rotator.providers}
     for p in custom:
         name = (p.get("name") or "").strip()
         if not name:
@@ -1625,24 +1629,45 @@ async def admin_providers(request: Request):
         # hain (provider ke effective keys ghat jaate hain — group editor me
         # bhi kam keys dikhti hain, "virtual model multiple keys" tootta hai).
         sel_keys = p.get("selected_keys") or []
+        # ENV KEYS SYNC: agar same-name config provider hai, uski runtime
+        # (env-resolved: ZEN_KEYS/GEMINI_KEYS etc) keys hi display karo —
+        # stored/deleted purani keys nahi. Runtime me provider na dikhe toh
+        # env-keyless hai → UI me disabled (router bhi use skip karta hai).
+        runtime_st = runtime_by_name.get(name)
+        if runtime_st is not None and runtime_st.cfg.keys:
+            cfg_enabled = p.get("enabled", True)
+            display_keys = list(runtime_st.cfg.keys)
+            config_key_base_urls = dict(runtime_st.cfg.key_base_urls)
+        elif runtime_st is not None:
+            cfg_enabled = False  # config wala provider ab env-keyless → runtime skip
+            display_keys = []
+            config_key_base_urls = {}
+        else:
+            cfg_enabled = p.get("enabled", True)
+            display_keys = [
+                k.strip()
+                for k in p.get("api_keys", [])
+                if k.strip() and not k.startswith("PASTE_")
+            ]
+            config_key_base_urls = dict(p.get("key_base_urls") or {})
         config_providers[name] = {
             "name": name,
             "type": p.get("type", "openai"),
             "base_url": p.get("base_url", ""),
             "models": [m.strip() for m in p.get("models", []) if m.strip()],
-            "enabled": p.get("enabled", True),
+            "enabled": cfg_enabled,
             "source": "custom",
-            "key_count": len(p.get("api_keys", [])),
-            "key_base_urls": dict(p.get("key_base_urls") or {}),
+            "key_count": len(display_keys),
+            "key_base_urls": config_key_base_urls,
             "selected_keys": sel_keys,
             "keys": [
                 {
                     "index": i,
                     "preview": _key_preview(k),
-                    "base_url": (p.get("key_base_urls") or {}).get(k, ""),
-                    "selected": (not sel_keys) or (i in sel_keys),
+                    "base_url": config_key_base_urls.get(k, ""),
+                    "selected": (not sel_keys) or True,
                 }
-                for i, k in enumerate(p.get("api_keys", []))
+                for i, k in enumerate(display_keys)
             ],
         }
 
@@ -1718,11 +1743,28 @@ async def admin_add_provider(req: CustomProviderInput, request: Request):
 
     # ---- keys: merge / replace / preserve ----
     new_keys = [k.strip() for k in req.api_keys if k.strip() and not k.startswith("PASTE_")]
+    # ENV KEYS SYNC (mirror of router._merge_custom_states): same-name config
+    # provider ka runtime (env-resolved: <NAME>_KEYS) hi source of truth hai —
+    # stored/deleted purani keys kabhi preserve NAHI karni. Render/env se keys
+    # hatane pe custom provider bhi same-name config ke saath sync rehta hai,
+    # warna admin Providers tab me Save dabata hai to deleted keys wapas merge
+    # ho jaati hain (purani encrypted store revive).
+    config_names = {p.get("name", "").strip() for p in _load_config().get("providers", [])}
+    is_config_provider = name in config_names
+    env_synced = [k for k in runtime_cfg["keys"] if not k.startswith("PASTE_")]
     if existing:
-        old_keys = list(existing.get("api_keys", []))
+        if env_synced:
+            old_keys = env_synced
+        elif is_config_provider:
+            # config wala provider env-keyless ho gaya → purani stored keys
+            # revive mat karo; "at least one key" error hi sahi hai (admin ko
+            # env me key daalna hai, provider ab effective disabled hai).
+            old_keys = []
+        else:
+            old_keys = list(existing.get("api_keys", []))
     else:
         # custom nahi hai → runtime (config/env) keys preserve karo
-        old_keys = [k for k in runtime_cfg["keys"] if not k.startswith("PASTE_")]
+        old_keys = env_synced
         if not old_keys:
             # bilkul naya provider (config.yaml me bhi nahi) — seedha
             # <NAME>_KEYS env var se keys pull karo. "Add Provider" UI
