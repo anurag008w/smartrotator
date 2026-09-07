@@ -20,6 +20,11 @@ MODEL_CATALOG: dict[str, list[str]] = {
         "gemini-2.0-flash-lite",
         "gemini-2.5-flash-lite",
         "gemini-2.5-pro-exp-03-25",
+        # Gemini LIVE / voice models — WebSocket (/v1/live) ke liye.
+        # NOTE: ye sirf Live API se chalti hain, unary generateContent se NAHI.
+        "gemini-3.1-flash-live-preview",
+        "gemini-3.1-flash-tts-preview",
+        "gemini-2.5-flash-native-audio-preview",
     ],
     "groq": [
         "llama-3.3-70b-versatile",
