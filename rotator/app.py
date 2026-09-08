@@ -591,9 +591,9 @@ async def _handle_live_ws(websocket: WebSocket):
                 await websocket.close(code=4403)
                 return
 
-        # 2) gemini key pick (rotation)
+        # 2) gemini key pick (rotation) — key + us key ka per-key live URL
         rotator: Rotator = websocket.app.state.rotator
-        key, key_label = live_proxy.pick_gemini_live_key(rotator)
+        key, key_label, live_upstream = live_proxy.pick_gemini_live_key(rotator)
         if not key:
             message = {
                 "error": {
@@ -630,6 +630,7 @@ async def _handle_live_ws(websocket: WebSocket):
                 client_send,
                 client_recv,
                 gemini_key=key,
+                upstream_base=live_upstream,
             )
         except WebSocketDisconnect:
             logger.info("live: client disconnected (user=%s)", user.username if user else "?")

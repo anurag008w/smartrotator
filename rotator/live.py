@@ -188,13 +188,19 @@ def _normalize_model(model_id: str) -> str:
     return m
 
 
-def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str]]:
+def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str, Optional[str]]]:
     """SmartRotator ke configured providers me se pehla ENABLED gemini provider
     dhoondo, aur uski KeyRing se ek available key pick karo.
 
-    Returns (api_key, key_label) ya (None, None) agar koi gemini key available
-    nahi. Key pick hone se rotation progress hogi (KeyRing.pick() state update
-    karta hai) — isliye ise sirf successful connect pe hi call karo.
+    Returns (api_key, key_label, live_upstream) ya (None, None, None) agar koi
+    gemini key available nahi. Key pick hone se rotation progress hogi
+    (KeyRing.pick() state update karta hai) — isliye ise sirf successful
+    connect pe hi call karo.
+
+    `live_upstream`: us key ka per-key base_url (key_base_urls) hai toh CF
+    worker /v1/live URL banakar deta hai (wss://<worker>/v1/live) — isse live
+    bhi usi key ke network/egress se jata hai (1 key = 1 URL design). Agar
+    per-key URL nahi hai toh None — relay server Google direct use karega.
     """
     for st in rotator.providers:
         if st.cfg.ptype != "gemini" or not st.cfg.keys:
@@ -204,8 +210,37 @@ def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str]]:
             continue
         state, _model = picked
         st.ring.report_success(state, None)  # connection try karna — fail aware
-        return state.key, state.label
-    return None, None
+        # per-key base_url → CF worker live WS URL (agar workers.dev hai)
+        per_key_url = st.cfg.key_base_urls.get(state.key, "") or ""
+        live_upstream = _live_ws_from_base_url(per_key_url)
+        return state.key, state.label, live_upstream
+    return None, None, None
+
+
+def _live_ws_from_base_url(base_url: str) -> Optional[str]:
+    """Per-key REST base_url se Gemini Live WebSocket URL banata hai.
+
+    SmartRotator me har Google key ka apna CF worker base_url hota hai, e.g.:
+        https://smartrotator.acc3.workers.dev/gemini/v1beta
+    Live ke liye wahi worker `/v1/live` pe WebSocket serve karta hai:
+        wss://smartrotator.acc3.workers.dev/v1/live
+
+    Agar URL workers.dev CF worker nahi hai (e.g. direct Google ya koi aur
+    gateway), toh None — relay default Google endpoint use karega.
+    """
+    b = (base_url or "").strip()
+    if not b or ".workers.dev" not in b:
+        return None
+    # scheme aur path ka koi bharosa nahi — host nikal ke wss://<host>/v1/live
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(b).hostname
+    except Exception:  # noqa: BLE001
+        host = None
+    if not host:
+        return None
+    return f"wss://{host}/v1/live"
 
 
 async def relay_live_session(
@@ -213,6 +248,7 @@ async def relay_live_session(
     client_recv,    # async iterator: client se JSON string/bytes aayengi
     *,
     gemini_key: str,
+    upstream_base: Optional[str] = None,
     heartbeat_interval: float = 20.0,
 ) -> dict:
     """Gemini Live API session proxy — transparent bidirectional relay.
@@ -227,6 +263,10 @@ async def relay_live_session(
       client_recv: client se messages de raha async iterator
                    (har item str ya bytes — text/base64 JSON).
       gemini_key:  SmartRotator ki gemini API key.
+      upstream_base:
+                   Pick hui key ka per-key CF worker /v1/live URL (wss://...).
+                   None ho toh default LIVE_WS_BASE use hota hai. Isse key ka
+                   apna network/egress path live ke liye bhi use hota hai.
 
     Returns session stats dict.
     """
@@ -276,10 +316,12 @@ async def relay_live_session(
     decoded_setup = normalized_setup
 
     # 2) Google Live API se connect karo (apni key ke saath).
-    #    GEMINI_LIVE_UPSTREAM set ho toh CF worker /v1/live jata hai (key
-    #    hidden); warna seedha Google endpoint. `?`/`&` dono handle karo.
-    sep = "&" if "?" in LIVE_WS_BASE else "?"
-    ws_url = f"{LIVE_WS_BASE}{sep}key={gemini_key}"
+    #    upstream_base (pick hui key ka per-key CF worker /v1/live) ho toh
+    #    wahan jata hai — key hidden, egress usi network se. Warna default
+    #    Google endpoint. `?`/`&` dono handle karo.
+    base = upstream_base or LIVE_WS_BASE
+    sep = "&" if "?" in base else "?"
+    ws_url = f"{base}{sep}key={gemini_key}"
     try:
         upstream = await websockets.connect(
             ws_url,
