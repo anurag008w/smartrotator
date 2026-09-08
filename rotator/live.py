@@ -87,6 +87,89 @@ def is_live_model(model_id: str) -> bool:
     return bool(_LIVE_MODEL_RE.search(model_id))
 
 
+# Native-audio live models (gemini-3.1-flash-live-preview, gemini-2.5-flash-
+# native-audio-*) sirf response_modalities=["AUDIO"] accept karte hain (docs +
+# python-genai issue #2238: TEXT pe 1011 Internal Error, TEXT+AUDIO pe
+# invalid-argument). NOTE: `gemini-live-2.5-flash-preview` TEXT support karta
+# hai — isliye sirf suffix `-live-preview` / `native-audio` wale normalize
+# karte hain, generic `live` substring nahi.
+_NATIVE_AUDIO_RE = re.compile(
+    r"(?:native[-_]audio|[-_]live[-_]preview$)", re.IGNORECASE
+)
+
+# Gemini TTS models Live API (BidiGenerateContent) me support NAHI hote —
+# wo unary/streaming REST generateContent (speech_config) use karte hain.
+_TTS_LIVE_UNSUPPORTED = re.compile(r"tts", re.IGNORECASE)
+
+
+def normalize_live_setup(setup_json: str, model_id: str) -> tuple[str, Optional[str]]:
+    """Google ke live models ke liye setup message normalize karo.
+
+    Problem (research-confirmed):
+      - `gemini-3.1-flash-live-preview` (native audio) sirf
+        `response_modalities: ["AUDIO"]` accept karta hai.
+      - `["TEXT"]` bhejo → 1011 Internal Error / connection close.
+      - `["TEXT", "AUDIO"]` dono → invalid argument / close.
+      - Text response ke liye official workaround: `["AUDIO"]` +
+        `output_audio_transcription: {}` — phir text `server_content.
+        output_transcription.text` me aata hai.
+
+    Isliye jab client TEXT ya TEXT+AUDIO maange, hum:
+      1. modalities ko [`AUDIO`] pe force karte hain
+      2. `output_audio_transcription` add karte hain (agar missing ho)
+         → client ko audio + text dono milte hain, connection nahi tootta.
+
+    TTS models Live API me support nahi karte — clear error dete hain.
+
+    Returns: (normalized_setup_json, error_message_or_None)
+    """
+    try:
+        obj = json.loads(setup_json)
+        setup = obj.get("setup")
+        if not isinstance(setup, dict):
+            return setup_json, None  # pehle _extract_setup verify kar chuka hai
+
+        model = _normalize_model(setup.get("model", "") or model_id)
+
+        # TTS — Live API unsupported (REST speech_config chahiye)
+        if _TTS_LIVE_UNSUPPORTED.search(model):
+            return setup_json, (
+                f"'{model}' Gemini TTS model hai — Live API (BidiGenerateContent) "
+                "ise support nahi karta. TTS ke liye unary/streaming "
+                "generateContent + speech_config use karo (SmartRotator ke normal "
+                "REST routes)."
+            )
+
+        # Sirf native-audio live models pe normalize chahiye
+        if not _NATIVE_AUDIO_RE.search(model):
+            return setup_json, None  # text-capable live models — as-is pass
+
+        gen_cfg = setup.get("generation_config")
+        if not isinstance(gen_cfg, dict):
+            gen_cfg = {}
+            setup["generation_config"] = gen_cfg
+
+        modalities = gen_cfg.get("response_modalities")
+        if not isinstance(modalities, list):
+            modalities = list(modalities) if modalities else []
+
+        norm_modalities = [str(m).upper() for m in modalities]
+
+        # Client ne TEXT chaha (TEXT ya TEXT+AUDIO) → AUDIO + transcription
+        if "TEXT" in norm_modalities:
+            gen_cfg["response_modalities"] = ["AUDIO"]
+            if "output_audio_transcription" not in setup:
+                setup["output_audio_transcription"] = {}
+        elif not norm_modalities:
+            # koi modality specify nahi — native audio default AUDIO (docs)
+            gen_cfg["response_modalities"] = ["AUDIO"]
+
+        # client ko transparent rakho — normalized JSON string
+        return json.dumps(obj, ensure_ascii=False), None
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return setup_json, None
+
+
 def _normalize_model(model_id: str) -> str:
     """model hisse se 'models/' prefix hatao aur host forms normalise karo."""
     m = (model_id or "").strip()
@@ -159,6 +242,28 @@ async def relay_live_session(
             )
         # invalid setup ho toh bina upstream connection ke close karo
         return {"ok": False, "reason": "invalid_setup"}
+
+    # 2) SETUP NORMALIZATION — native-audio live models sirf AUDIO modality
+    #    accept karte hain. Client TEXT/TEXT+AUDIO maange toh 1011/invalid-
+    #    argument milta hai (research-confirmed). AUDIO + output_audio_
+    #    transcription force karo taaki connection na tootte aur text bhi
+    #    aaye (`server_content.output_transcription.text`).
+    normalized_setup, normalize_error = normalize_live_setup(
+        decoded_setup, setup_model
+    )
+    if normalize_error:
+        await client_send(
+            json.dumps(
+                {
+                    "error": {
+                        "code": "MODEL_NOT_LIVE_COMPATIBLE",
+                        "message": normalize_error,
+                    }
+                }
+            )
+        )
+        return {"ok": False, "reason": "model_not_live_compatible"}        
+    decoded_setup = normalized_setup
 
     # 2) Google Live API se connect karo (apni key ke saath)
     ws_url = f"{LIVE_WS_BASE}?key={gemini_key}"
