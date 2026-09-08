@@ -69,6 +69,41 @@ from .router import Rotator
 
 logger = logging.getLogger("smartrotator")
 
+# ---------------------------------------------------------------------------
+# SECURITY: API keys kabhi logs me nahi — global redact filter.
+# SmartRotator ke clients (LevelUp/SDK) WS connect me `?key=<user_key>`
+# bhejte hain (Google-compatible format) aur Render logs pe URL print hota
+# tha:  WebSocket /v1/live?key=sk-e4G0...  ← user key EXPOSE ho rahi thi.
+# Yeh filter HAR logger (smartrotator + uvicorn access/error) ke message me
+# `?key=...` / `&key=...` ko `key=***` me badal deta hai — ek jagah fix,
+# saari logs protect.
+class _RedactKeyFilter(logging.Filter):
+    _KEY_RE = re.compile(r"\bkey=[^&\s\"'<>$]+")
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001 — logging kabhi crash na kare
+            return True
+        if "key=" not in msg:
+            return True
+        new = self._KEY_RE.sub("key=***", msg)
+        if new != msg:
+            record.msg = new
+            record.args = ()
+        return True
+
+
+for _log_name in (
+    "",  # root — koi bhi logger
+    "uvicorn",
+    "uvicorn.access",
+    "uvicorn.error",
+    "smartrotator",
+    "smartrotator.live",
+):
+    logging.getLogger(_log_name).addFilter(_RedactKeyFilter())
+
 CONFIG_PATH = os.environ.get("ROTATOR_CONFIG", "config.yaml")
 
 # config.yaml har request pe disk se YAML parse karna slow hai (~25ms) —
@@ -155,6 +190,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class _NormalizeDoubleSlash:
+    """Google GenAI SDK (LevelUp Live) ke liye: SDK ka getWebsocketBaseUrl()
+    root URL ko `URL.toString()` se normalize karta hai (trailing slash add)
+    aur phir `/ws/...BidiGenerateContent` append karta hai — isse URL banta hai:
+
+      wss://smartrotator.onrender.com//ws/google.ai.generativelanguage.v1beta...
+
+    Double-slash path Starlette ke exact route match me fail hota hai (HTTP 403
+    on Render) → SDK error → LevelUp ka auto-reconnect spin ho jata tha
+    (infinite "reconnecting" loop, safety valve bhi drain).
+
+    Yeh pure-ASGI wrapper scope["path"] + ["raw_path"] me double slashes ko
+    single me collapse karta hai — BOTH http AND websocket, kyunki FastAPI ka
+    @app.middleware("http") sirf HTTP pe lagta hai, websocket routes ke liye
+    raw ASGI middleware chahiye. Yield-free, log-safe, koi mutation nahi.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") in ("http", "websocket"):
+            path = scope.get("path") or ""
+            if "//" in path:
+                scope["path"] = re.sub(r"/{2,}", "/", path)
+                raw_path = scope.get("raw_path") or b""
+                if b"//" in raw_path:
+                    try:
+                        scope["raw_path"] = re.sub(rb"/{2,}", b"/", raw_path)
+                    except Exception:  # noqa: BLE001 — normalization kabhi crash na kare
+                        pass
+        await self.inner(scope, receive, send)
 
 
 # --------------------------------------------------------------------------
@@ -3970,6 +4039,12 @@ function showView(name) {
 </body>
 </html>
 """
+
+
+# uvicorn rotator.app:app `app` attribute import karta hai — wrapper FastAPI
+# ko wrap karta hai taaki HAR request/websocket pe double-slash normalize ho.
+# (File ke END me rakha hai — iske baad koi `@app...` decorator nahi hai.)
+app = _NormalizeDoubleSlash(app)
 
 
 def main() -> None:
