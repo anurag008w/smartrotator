@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Optional, Tuple
 
@@ -65,9 +66,18 @@ logger = logging.getLogger("smartrotator.live")
 
 # Google Gemini Live API — BidiGenerateContent raw WebSocket endpoint (v1beta).
 # Authentication `?key=` query param se hoti hai (raw WS docs ke mutabik).
-LIVE_WS_BASE = (
-    "wss://generativelanguage.googleapis.com/ws/"
-    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+#
+# UPSTREAM OVERRIDE: SmartRotator ki Google keys hamesha iske paas rehti hain,
+# par live ka network path ek Cloudflare Worker (GEMINI_LIVE_UPSTREAM) ho sakta
+# hai. SmartRotator apne GEMINI_KEYS pool se key pick karke is URL me `?key=`
+# ke saath bhejta hai; CF worker transparently Google se connect karta hai
+# (key client ko nahi dikhti). Default: seedha Google ka endpoint.
+LIVE_WS_BASE = os.environ.get(
+    "GEMINI_LIVE_UPSTREAM",
+    (
+        "wss://generativelanguage.googleapis.com/ws/"
+        "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+    ),
 )
 
 # Jin model names ko "live" maane —- normal text models wo nahi chalate.
@@ -265,8 +275,11 @@ async def relay_live_session(
         return {"ok": False, "reason": "model_not_live_compatible"}        
     decoded_setup = normalized_setup
 
-    # 2) Google Live API se connect karo (apni key ke saath)
-    ws_url = f"{LIVE_WS_BASE}?key={gemini_key}"
+    # 2) Google Live API se connect karo (apni key ke saath).
+    #    GEMINI_LIVE_UPSTREAM set ho toh CF worker /v1/live jata hai (key
+    #    hidden); warna seedha Google endpoint. `?`/`&` dono handle karo.
+    sep = "&" if "?" in LIVE_WS_BASE else "?"
+    ws_url = f"{LIVE_WS_BASE}{sep}key={gemini_key}"
     try:
         upstream = await websockets.connect(
             ws_url,
