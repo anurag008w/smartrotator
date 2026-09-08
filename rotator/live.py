@@ -62,6 +62,15 @@ from typing import Optional, Tuple
 
 import websockets
 
+try:  # FastAPI stream ka WebSocketDisconnect — relay me expected disconnect
+    from fastapi import WebSocketDisconnect
+except ImportError:  # pragma: no cover — standalone/test bina FastAPI ke
+    class WebSocketDisconnect(Exception):  # type: ignore[no-redef]
+        def __init__(self, code: int = 1000, reason: str = "", **kwargs):  # noqa: N802
+            super().__init__(reason)
+            self.code = code
+            self.reason = reason
+
 logger = logging.getLogger("smartrotator.live")
 
 # Google Gemini Live API — BidiGenerateContent raw WebSocket endpoint (v1beta).
@@ -160,7 +169,11 @@ def normalize_live_setup(setup_json: str, model_id: str) -> tuple[str, Optional[
             setup["generation_config"] = gen_cfg
 
         modalities = gen_cfg.get("response_modalities")
-        if not isinstance(modalities, list):
+        # JSON string bhi ho sakta hai ("response_modalities": "TEXT") —
+        # `list("TEXT")` = ['T','E','X','T'] galat hota, pehle wrap karo.
+        if isinstance(modalities, str):
+            modalities = [modalities]
+        elif not isinstance(modalities, list):
             modalities = list(modalities) if modalities else []
 
         norm_modalities = [str(m).upper() for m in modalities]
@@ -188,12 +201,12 @@ def _normalize_model(model_id: str) -> str:
     return m
 
 
-def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str, Optional[str]]]:
+def pick_gemini_live_key(rotator) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[object], Optional[object]]:
     """SmartRotator ke configured providers me se pehla ENABLED gemini provider
     dhoondo, aur uski KeyRing se ek available key pick karo.
 
-    Returns (api_key, key_label, live_upstream) ya (None, None, None) agar koi
-    gemini key available nahi. Key pick hone se rotation progress hogi
+    Returns (api_key, key_label, live_upstream, ring, state) sab None ho toh
+    koi gemini key available nahi. Key pick hone se rotation progress hogi
     (KeyRing.pick() state update karta hai) — isliye ise sirf successful
     connect pe hi call karo.
 
@@ -201,6 +214,10 @@ def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str, Optional[str]]]:
     worker /v1/live URL banakar deta hai (wss://<worker>/v1/live) — isse live
     bhi usi key ke network/egress se jata hai (1 key = 1 URL design). Agar
     per-key URL nahi hai toh None — relay server Google direct use karega.
+
+    `ring`/`state` caller ko return hote hain taaki success/failure report
+    ACTUAL outcome ke baad ho (connect fail hone pe bhi success report karna
+    galat hai — pehle yahan report_success premature tha).
     """
     for st in rotator.providers:
         if st.cfg.ptype != "gemini" or not st.cfg.keys:
@@ -209,12 +226,13 @@ def pick_gemini_live_key(rotator) -> Optional[Tuple[str, str, Optional[str]]]:
         if picked is None:
             continue
         state, _model = picked
-        st.ring.report_success(state, None)  # connection try karna — fail aware
+        # NOTE: report_success/report_failure YAHAN NAHI — caller relay ke
+        # baad actual outcome ke aadhar pe report karta hai (audit fix).
         # per-key base_url → CF worker live WS URL (agar workers.dev hai)
         per_key_url = st.cfg.key_base_urls.get(state.key, "") or ""
         live_upstream = _live_ws_from_base_url(per_key_url)
-        return state.key, state.label, live_upstream
-    return None, None, None
+        return state.key, state.label, live_upstream, st.ring, state
+    return None, None, None, None, None
 
 
 def _live_ws_from_base_url(base_url: str) -> Optional[str]:
@@ -350,11 +368,36 @@ async def relay_live_session(
 
     try:
         # 3) client ka setup Google ko bhejo (normalized model + bina badlaav)
-        await upstream.send(decoded_setup)
+        #    AUDIT FIX #7: agar send khud fail ho (upstream connect ke turant
+        #    baad close ho gaya) client ko SPECIFIC error mile, generic
+        #    SESSION_ERROR nahi.
+        try:
+            await upstream.send(decoded_setup)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("live: setup send to upstream failed: %r", exc)
+            try:
+                await client_send(
+                    json.dumps(
+                        {
+                            "error": {
+                                "code": "SETUP_FORWARD_FAILED",
+                                "message": (
+                                    "Setup message Google ko forward nahi ho saka: "
+                                    f"{exc}"
+                                ),
+                            }
+                        }
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "ok": False,
+                "reason": "setup_send_failed",
+                "error": str(exc),
+            }
 
         # 4) bidirectional relay — do tasks aage-piche frames copy karte hain.
-        client_ok = asyncio.Event()
-        upstream_ok = asyncio.Event()
 
         async def client_to_upstream():
             try:
@@ -365,6 +408,13 @@ async def relay_live_session(
                         await upstream.send(str(msg))
             except asyncio.CancelledError:  # noqa: BLE001
                 pass
+            except WebSocketDisconnect as wsd:
+                # Client ne normal close kiya (disconnect = expected, error nahi)
+                logger.info(
+                    "live: client disconnected (%s, code=%s)",
+                    getattr(wsd, "reason", "") or "no reason",
+                    getattr(wsd, "code", 1000),
+                )
             except Exception as exc:  # noqa: BLE001
                 # Audio/setup aage-piche relay ke duran upstream fail
                 # (Google ne conn close kiya / send fail). Hot diagnostic —
@@ -374,8 +424,6 @@ async def relay_live_session(
                     "hai audio; closing session)",
                     exc,
                 )
-            finally:
-                client_ok.set()
 
         async def upstream_to_client():
             try:
@@ -386,12 +434,14 @@ async def relay_live_session(
                         await client_send(str(msg))
             except asyncio.CancelledError:  # noqa: BLE001
                 pass
+            except WebSocketDisconnect as wsd:
+                logger.info(
+                    "live: upstream/disconnect (code=%s)", getattr(wsd, "code", 1000)
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "live: upstream->client relay error: %r", exc
                 )
-            finally:
-                upstream_ok.set()
 
         relay_client = asyncio.create_task(client_to_upstream())
         relay_upstream = asyncio.create_task(upstream_to_client())

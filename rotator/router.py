@@ -178,6 +178,12 @@ class Rotator:
                 custom_headers=dict(cfg.get("custom_headers") or {}),
                 opencode_headers=bool(cfg.get("opencode_headers", False)),
                 opencode_version=(cfg.get("opencode_version") or "").strip() or None,
+                # AUDIT FIX: config.yaml me key_base_urls bhi hone chahiye —
+                # pehle siraf dashboard/custom path me pass hota tha, yahan
+                # silently drop ho jata (live per-key CF URL kabhi nahi milta).
+                key_base_urls={
+                    k: v for k, v in (cfg.get("key_base_urls") or {}).items() if k in keys
+                },
             )
         )
 

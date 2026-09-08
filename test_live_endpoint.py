@@ -198,14 +198,100 @@ def test_relay_invalid_setup_no_upstream():
     return True
 
 
+def test_live_ws_from_base_url():
+    """Per-key base_url se CF worker live WS URL banana (bug #6 audit fix)."""
+    cases = {
+        # workers.dev → wss://<host>/v1/live
+        "https://smartrotator.hridayarya52.workers.dev/gemini/v1beta":
+            "wss://smartrotator.hridayarya52.workers.dev/v1/live",
+        "https://smartrotator.smartrotator.workers.dev":
+            "wss://smartrotator.smartrotator.workers.dev/v1/live",
+        "https://smartrotator.anuragwankhede65.workers.dev/":
+            "wss://smartrotator.anuragwankhede65.workers.dev/v1/live",
+        # non-CF / invalid → None
+        "": None,
+        "https://generativelanguage.googleapis.com/v1beta": None,
+        "https://api.openai.com/v1": None,
+        "not a url": None,
+    }
+    for base, expected in cases.items():
+        got = live_proxy._live_ws_from_base_url(base)
+        assert got == expected, f"{base!r}: expected {expected!r}, got {got!r}"
+    return True
+
+
+def test_relay_uses_per_key_upstream():
+    """upstream_base (per-key CF URL) diya ho toh URL me wahi host + ?key
+    hona chahiye (1 key = 1 URL design)."""
+    global _mock
+    _mock = MockUpstream(
+        responses=[
+            b'{"setupComplete": {}}',
+            b'{"serverContent": {"modelTurn": {"parts": [{"inlineData": {"data": "AQID", "mimeType": "audio/pcm"}}]}}}',
+        ]
+    )
+    captured = {}
+
+    async def fake_connect(*args, **kwargs):
+        captured["url"] = args[0] if args else kwargs.get("uri")
+        return _mock
+
+    live_proxy.websockets.connect = fake_connect
+
+    async def run():
+        collector = Collector()
+        stream = _make_client_stream(
+            [json.dumps({"setup": {"model": "models/gemini-3.1-flash-live-preview"}})]
+        )
+        stats = await live_proxy.relay_live_session(
+            collector,
+            stream.__aiter__(),
+            gemini_key="sk-real-google-key",
+            upstream_base="wss://smartrotator.acc3.workers.dev/v1/live",
+        )
+        return collector, stats
+
+    collector, stats = asyncio.run(run())
+    assert stats.get("ok") is True, stats
+    assert "wss://smartrotator.acc3.workers.dev/v1/live" in captured["url"], captured
+    assert "key=sk-real-google-key" in captured["url"], captured
+    # workers.dev host preserved — direct Google nahi gaya
+    assert "generativelanguage.googleapis.com" not in captured["url"], captured
+    assert '"setupComplete"' in collector.join()
+    return True
+
+
+def test_normalize_modalities_string():
+    """response_modalities string form me aaye toh normalize (bug #3 audit
+    fix): 'TEXT' → ['AUDIO'] + transcription, `list('TEXT')` bug na ho."""
+    setup = json.dumps(
+        {
+            "setup": {
+                "model": "models/gemini-3.1-flash-live-preview",
+                "generation_config": {"response_modalities": "TEXT"},
+            }
+        }
+    )
+    normalized, err = live_proxy.normalize_live_setup(setup, "gemini-3.1-flash-live-preview")
+    assert err is None, err
+    obj = json.loads(normalized)
+    gcfg = obj["setup"]["generation_config"]
+    assert gcfg["response_modalities"] == ["AUDIO"], gcfg
+    assert "output_audio_transcription" in obj["setup"], obj["setup"]
+    return True
+
+
 if __name__ == "__main__":
     tests = [
         ("live model detection", test_live_model_detection),
         ("setup parse valid", test_extract_setup_valid),
         ("setup parse bytes", test_extract_setup_bytes),
         ("setup parse invalid", test_extract_setup_invalid),
+        ("live ws from base url", test_live_ws_from_base_url),
         ("relay basic flow", test_relay_basic_flow),
         ("relay invalid setup no upstream", test_relay_invalid_setup_no_upstream),
+        ("relay per-key upstream", test_relay_uses_per_key_upstream),
+        ("normalize modalities string", test_normalize_modalities_string),
     ]
     failed = 0
     for label, fn in tests:

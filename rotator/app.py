@@ -593,7 +593,9 @@ async def _handle_live_ws(websocket: WebSocket):
 
         # 2) gemini key pick (rotation) — key + us key ka per-key live URL
         rotator: Rotator = websocket.app.state.rotator
-        key, key_label, live_upstream = live_proxy.pick_gemini_live_key(rotator)
+        key, key_label, live_upstream, live_ring, live_state = (
+            live_proxy.pick_gemini_live_key(rotator)
+        )
         if not key:
             message = {
                 "error": {
@@ -651,6 +653,20 @@ async def _handle_live_ws(websocket: WebSocket):
             except Exception:  # noqa: BLE001
                 pass
             stats = {"ok": False, "reason": "session_error", "error": str(exc)}
+
+        # AUDIT FIX #1: key ka success/failure report ACTUAL outcome pe —
+        # pick time pe nahi (pehle connect fail hone pe bhi success report ho
+        # jata tha, kharab key dobara pick hoti thi). Setup hi nahi chala
+        # (invalid_setup / model_not_live_compatible) toh key ko blame mat
+        # karo — client/model ki galti hai.
+        if live_ring is not None and live_state is not None:
+            reason = (stats or {}).get("reason")
+            if stats.get("ok") and not stats.get("error"):
+                live_ring.report_success(live_state, None)
+            elif reason in ("upstream_connect_failed", "session_error", "setup_send_failed"):
+                live_ring.report_failure(live_state, None)
+            # invalid_setup / model_not_live_compatible / client_disconnected
+            # → neutral (key pe report nahi)
 
         # 4) quota handling — graceful close ho ya error, setup hi nahi bana
         #    toh reserved quota refund karte hain (session upstream tak gaya
